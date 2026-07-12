@@ -24,7 +24,13 @@ import pandas as pd
 import torch
 from biotite.structure import AtomArray
 
+from protenix.data.antibody_cdr import (
+    add_is_cdr_residue_to_token_array,
+    resolve_sabdab_roles,
+    strip_cdr_side_chains,
+)
 from protenix.data.core.parser import (
+    AddAtomArrayAnnot,
     DistillationMMCIFParser,
     MMCIFParser,
     RecentPDB_MMCIFParser,
@@ -51,6 +57,8 @@ class DataPipeline(object):
         mmcif: Union[str, Path],
         pdb_cluster_file: Union[str, Path, None] = None,
         dataset: str = "WeightedPDB",
+        strip_antibody_cdr: bool = False,
+        sabdab_roles: Union[dict, None] = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """
         Get raw data from mmcif with tokenizer and a list of chains and interfaces for sampling.
@@ -60,6 +68,11 @@ class DataPipeline(object):
             pdb_cluster_file (Union[str, Path, None], optional): Cluster info txt file. Defaults to None.
             dataset (str, optional): The dataset type, either "WeightedPDB" or "Distillation". Defaults to "WeightedPDB".
             interface_radius (float, optional): The radius of the interface. Defaults to 5.
+            strip_antibody_cdr (bool, optional): If True, remove side-chain atoms of
+                antibody variable-domain CDR residues (keeping backbone + CB) to
+                prevent atom-count/reference-conformer leakage of the design target,
+                add a per-atom ``is_cdr`` annotation on the AtomArray and a per-token
+                ``is_cdr_residue`` annotation on the TokenArray. Defaults to False.
         Returns:
             tuple[list[dict[str, Any]], dict[str, Any]]:
                 sample_indices_list (list[dict[str, Any]]): The sample indices list (each one is a chain or an interface).
@@ -93,12 +106,54 @@ class DataPipeline(object):
                 "resolution", [parser.resolution] * len(atom_array)
             )
 
+            if strip_antibody_cdr:
+                # Strip antibody CDR side chains (keep backbone + CB) before
+                # tokenization. Only ref_pos/ref_charge/ref_mask/res_perm depend on
+                # the per-residue atom set, so recompute just those; all other
+                # per-atom annotations survive boolean indexing (CA/CB are kept).
+                atom_array, n_removed = strip_cdr_side_chains(atom_array)
+                if n_removed > 0:
+                    atom_array = AddAtomArrayAnnot.add_ref_info_and_res_perm(atom_array)
+                bioassembly_dict["atom_array"] = atom_array
+                bioassembly_dict["num_tokens"] = int(
+                    atom_array.centre_atom_mask.sum()
+                )
+
             tokenizer = AtomArrayTokenizer(atom_array)
             token_array = tokenizer.get_token_array()
+            if strip_antibody_cdr:
+                # Propagate the per-atom ``is_cdr`` flag to a per-token
+                # ``is_cdr_residue`` annotation so downstream code can identify
+                # design-region tokens without re-inspecting the AtomArray.
+                token_array = add_is_cdr_residue_to_token_array(
+                    token_array, atom_array
+                )
             bioassembly_dict["msa_features"] = None
             bioassembly_dict["template_features"] = None
 
             bioassembly_dict["token_array"] = token_array
+
+            # Surface antibody chain roles onto every per-sample index row so the
+            # indices CSV carries H/L/antigen chain ids (the MFDesign AntibodyInfo
+            # analog). Roles come from MFDesign's curated SAbDab summary CSV; when no
+            # table is supplied or this PDB is absent from it, the columns are written
+            # empty to keep the CSV schema stable.
+            heavy_ids: list[str] = []
+            light_ids: list[str] = []
+            antigen_ids: list[str] = []
+            if sabdab_roles:
+                entries = sabdab_roles.get(str(bioassembly_dict["pdb_id"]).lower())
+                if entries:
+                    heavy_ids, light_ids, antigen_ids = resolve_sabdab_roles(
+                        atom_array, entries
+                    )
+            for row in sample_indices_list:
+                # Single-antibody assumption: first heavy/light chain. Values are
+                # asym_id_int chain indices (MFDesign-style), not label chain ids.
+                row["H_chain_id"] = heavy_ids[0] if heavy_ids else ""
+                row["L_chain_id"] = light_ids[0] if light_ids else ""
+                row["antigen_chain_ids"] = ";".join(str(a) for a in antigen_ids)
+
             return sample_indices_list, bioassembly_dict
 
         except Exception as e:

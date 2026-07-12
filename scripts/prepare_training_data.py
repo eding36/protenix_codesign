@@ -22,6 +22,7 @@ import pandas as pd
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
+from protenix.data.antibody_cdr import load_sabdab_chain_roles
 from protenix.data.pipeline.data_pipeline import DataPipeline
 from protenix.utils.file_io import dump_gzip_pickle
 
@@ -31,6 +32,8 @@ def gen_a_bioassembly_data(
     bioassembly_output_dir: Path,
     cluster_file: Optional[Path],
     distillation: bool = False,
+    strip_antibody_cdr: bool = True,
+    sabdab_roles: Optional[dict] = None,
 ) -> Optional[list[dict]]:
     """
     Generates bioassembly data from an mmCIF file and saves it to the specified output directory.
@@ -40,6 +43,8 @@ def gen_a_bioassembly_data(
         bioassembly_output_dir (Path): Directory where the bioassembly data will be saved.
         cluster_file (Optional[Path]): Path to the cluster file, if available.
         distillation (bool, optional): Flag indicating whether to use the 'Distillation' setting. Defaults to False.
+        strip_antibody_cdr (bool, optional): If True, strip antibody CDR side chains
+            (keep backbone + CB) and add an ``is_cdr`` annotation. Defaults to False.
 
     Returns:
         Optional[list[dict]]: A list of sample indices if data is successfully generated, otherwise None.
@@ -50,7 +55,11 @@ def gen_a_bioassembly_data(
         dataset = "WeightedPDB"
 
     sample_indices_list, bioassembly_dict = DataPipeline.get_data_from_mmcif(
-        mmcif, cluster_file, dataset
+        mmcif,
+        cluster_file,
+        dataset,
+        strip_antibody_cdr=strip_antibody_cdr,
+        sabdab_roles=sabdab_roles,
     )
 
     if sample_indices_list and bioassembly_dict:
@@ -67,6 +76,8 @@ def gen_data_from_mmcifs(
     cluster_file: Optional[Path],
     distillation: bool = False,
     num_workers: int = 1,
+    strip_antibody_cdr: bool = False,
+    sabdab_roles: Optional[dict] = None,
 ):
     """
     Generates training data from a list of mmCIF files and saves the results to a CSV file.
@@ -78,6 +89,8 @@ def gen_data_from_mmcifs(
         cluster_file (Optional[Path]): Path to the cluster file. If None, clustering is not performed.
         distillation (bool, optional): Flag indicating whether to use the 'Distillation' setting. Defaults to False.
         num_workers (int, optional): Number of parallel workers to use. Defaults to 1.
+        strip_antibody_cdr (bool, optional): If True, strip antibody CDR side chains
+            (keep backbone + CB) and add an ``is_cdr`` annotation. Defaults to False.
     """
     random.shuffle(mmcif_list)
 
@@ -86,7 +99,12 @@ def gen_data_from_mmcifs(
         for r in tqdm(
             Parallel(n_jobs=num_workers, return_as="generator_unordered")(
                 delayed(gen_a_bioassembly_data)(
-                    mmcif, bioassembly_output_dir, cluster_file, distillation
+                    mmcif,
+                    bioassembly_output_dir,
+                    cluster_file,
+                    distillation,
+                    strip_antibody_cdr,
+                    sabdab_roles,
                 )
                 for mmcif in mmcif_list
             ),
@@ -110,6 +128,8 @@ def run_gen_data(
     cluster_file: Optional[Path],
     distillation: bool = False,
     num_workers: int = 1,
+    strip_antibody_cdr: bool = False,
+    sabdab_summary: Optional[Path] = None,
 ):
     """
     Generates data from MMCIF files and saves the output to specified locations.
@@ -142,6 +162,13 @@ def run_gen_data(
     else:
         raise NotImplementedError(f"Unsupported input path: {input_path}")
 
+    # Curation-first H/L/antigen labels: reuse MFDesign's processed summary CSV
+    # (already H/L-corrected and filtered) instead of inferring the antigen. Loaded
+    # once here and broadcast to the workers.
+    sabdab_roles = (
+        load_sabdab_chain_roles(sabdab_summary) if sabdab_summary is not None else None
+    )
+
     gen_data_from_mmcifs(
         mmcif_list,
         output_indices_csv,
@@ -149,6 +176,8 @@ def run_gen_data(
         cluster_file,
         distillation,
         num_workers,
+        strip_antibody_cdr,
+        sabdab_roles,
     )
 
 
@@ -198,6 +227,28 @@ if __name__ == "__main__":
         help="Number of worker processes to use. Defaults to 1.",
     )
 
+    parser.add_argument(
+        "--strip_antibody_cdr",
+        action="store_true",
+        help=(
+            "Strip antibody variable-domain CDR side chains (keep backbone + CB) "
+            "and add a per-atom 'is_cdr' annotation, to prevent leakage of the "
+            "design target. Requires 'abnumber' (ANARCI/anarcii)."
+        ),
+    )
+
+    parser.add_argument(
+        "--sabdab_summary",
+        type=Path,
+        default=None,
+        help=(
+            "Path to MFDesign's processed summary CSV (columns pdb, H_chain_id, "
+            "L_chain_id, antigen_chain_id). When given, the indices CSV's "
+            "H_chain_id/L_chain_id/antigen_chain_ids columns use these curated, "
+            "H/L-corrected SAbDab labels instead of abnumber-inferred roles."
+        ),
+    )
+
     args = parser.parse_args()
 
     run_gen_data(
@@ -207,4 +258,6 @@ if __name__ == "__main__":
         cluster_file=args.cluster_file,
         distillation=args.distillation,
         num_workers=args.n_cpu,
+        strip_antibody_cdr=args.strip_antibody_cdr,
+        sabdab_summary=args.sabdab_summary,
     )
