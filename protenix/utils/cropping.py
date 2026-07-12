@@ -410,6 +410,132 @@ def get_continues_crop_index(
     return selected_token_indices
 
 
+def get_antibody_crop_index(
+    chain_id: np.ndarray,
+    res_id: np.ndarray,
+    center_coords: np.ndarray,
+    atom_num: np.ndarray,
+    is_resolved: np.ndarray,
+    is_cdr: Optional[np.ndarray],
+    ref_chain_indices: list[int],
+    crop_size: int,
+    add_antigen: bool = True,
+    min_neighborhood: int = 0,
+    max_neighborhood: int = 40,
+    max_atoms: Optional[int] = None,
+) -> tuple[torch.Tensor, int]:
+    """Antibody-centric crop (ported from MFDesign ``AntibodyCropper``).
+
+    Initially, add the full resolved antibody variable domain (all tokens from
+    the heavy and light chains). When ``add_antigen`` is set, it additionally grows a
+    spatial neighborhood of antigen tokens around a randomly chosen CDR anchor token,
+    residue-window by residue-window, until the ``crop_size`` (and optional
+    ``max_atoms``) budget is reached -- the analog of MFDesign selecting epitope
+    residues near a CDR query token.
+
+    Note on the epitope filter: MFDesign restricts antigen candidates with its
+    ``token_mask`` (a pre-marked epitope/spec mask). Protenix's ``is_cdr_residue`` only
+    flags antibody CDR residues, never the antigen, so here the CDR mask is used to pick
+    the *anchor* on the antibody and every resolved non-antibody token is a candidate;
+    proximity to the CDR anchor then plays the epitope-selection role.
+
+    Args:
+        chain_id: [N] per-token ``asym_id_int``.
+        res_id: [N] per-token residue id (used for the residue window).
+        center_coords: [N, 3] per-token centre-atom coordinates.
+        atom_num: [N] per-token atom count.
+        is_resolved: [N] per-token resolved mask.
+        is_cdr: [N] per-token CDR mask, or ``None`` when CDR stripping was not run.
+        ref_chain_indices: the heavy/light ``asym_id_int`` chains to keep whole.
+        crop_size: maximum number of tokens to keep.
+        add_antigen: whether to grow an antigen neighborhood around a CDR anchor.
+        min_neighborhood / max_neighborhood: residue-window sizes sampled per antigen seed.
+        max_atoms: optional atom budget; ``None`` bounds by tokens only.
+
+    Returns:
+        (selected_token_indices, reference_token_index): sorted token indices (torch) and
+        the CDR anchor token index (or -1 when no antigen neighborhood was added).
+    """
+    n_token = chain_id.shape[0]
+    all_idx = np.arange(n_token)
+    ref_chain_indices = [c for c in ref_chain_indices if c is not None]
+
+    cropped: set[int] = set()
+    total_atoms = 0
+    #add all Fv region to crop
+    for c in ref_chain_indices:
+        sel = (chain_id == c) & is_resolved
+        cropped.update(all_idx[sel].tolist())
+        total_atoms += int(atom_num[sel].sum())
+
+    if not cropped:
+        raise ValueError("No resolved antibody (H/L) tokens to crop")
+
+    reference_token_index = -1
+    antigen_mask = (~np.isin(chain_id, ref_chain_indices)) & is_resolved
+    #logic for exploring & adding antigen tokens to the crop
+    if add_antigen and ref_chain_indices and antigen_mask.any():
+        neighborhood_sizes = list(range(min_neighborhood, max_neighborhood + 1, 2))
+        neighborhood_size = int(
+            neighborhood_sizes[random.randrange(len(neighborhood_sizes))]
+        )
+
+        # Pick a CDR anchor token on a random antibody chain (fall back to any
+        # resolved token on that chain when no CDR mask is available).
+        anchor_chain = random.choice(ref_chain_indices)
+        anchor_pool = all_idx[(chain_id == anchor_chain) & is_resolved]
+        if is_cdr is not None:
+            cdr_pool = all_idx[(chain_id == anchor_chain) & is_resolved & is_cdr]
+            if cdr_pool.size:
+                anchor_pool = cdr_pool
+        query_idx = int(anchor_pool[random.randrange(anchor_pool.size)])
+        query_coord = center_coords[query_idx]
+
+        antigen_idx = all_idx[antigen_mask]
+        dists = np.linalg.norm(center_coords[antigen_idx] - query_coord, axis=1)
+        order = antigen_idx[np.argsort(dists)]
+
+        for seed in order:
+            chain_tok = all_idx[chain_id == chain_id[seed]]
+            seed_res = res_id[seed]
+            if chain_tok.size <= neighborhood_size:
+                new_tok = chain_tok
+            else:
+                bounded = chain_tok[
+                    (res_id[chain_tok] >= seed_res - neighborhood_size)
+                    & (res_id[chain_tok] <= seed_res + neighborhood_size)
+                ]
+                new_tok = bounded[res_id[bounded] == seed_res]
+                r = 0
+                while new_tok.size < neighborhood_size and r < neighborhood_size:
+                    r += 1
+                    new_tok = bounded[
+                        (res_id[bounded] >= seed_res - r)
+                        & (res_id[bounded] <= seed_res + r)
+                    ]
+
+            new_indices = set(new_tok.tolist()) - cropped
+            if not new_indices:
+                continue
+            new_atoms = int(atom_num[list(new_indices)].sum())
+            if (len(new_indices) > (crop_size - len(cropped))) or (
+                max_atoms is not None and (total_atoms + new_atoms) > max_atoms
+            ):
+                break
+            cropped.update(new_indices)
+            total_atoms += new_atoms
+            if reference_token_index == -1:
+                reference_token_index = query_idx
+
+    if len(cropped) > crop_size:
+        raise ValueError(
+            f"Antibody cropping selected {len(cropped)} tokens, more than {crop_size}"
+        )
+
+    selected_token_indices = torch.tensor(sorted(cropped), dtype=torch.long)
+    return selected_token_indices, reference_token_index
+
+
 class CropData(object):
     """
     Crop the data based on the given crop size and reference chain indices (asym_id).
@@ -438,6 +564,9 @@ class CropData(object):
         spatial_crop_complete_lig: bool = False,
         drop_last: bool = False,
         remove_metal: bool = False,
+        antibody_add_antigen: bool = True,
+        antibody_min_neighborhood: int = 0,
+        antibody_max_neighborhood: int = 40,
     ) -> None:
         self.crop_size = crop_size
         self.ref_chain_indices = ref_chain_indices
@@ -449,10 +578,15 @@ class CropData(object):
             "SpatialCropping",
             "SpatialInterfaceCropping",
         ]
+        # "AntibodyCropping" is not part of the randomly-weighted pool; it is selected
+        # deterministically for antibody samples (see DataPipeline.crop).
         self.contiguous_crop_complete_lig = contiguous_crop_complete_lig
         self.spatial_crop_complete_lig = spatial_crop_complete_lig
         self.drop_last = drop_last
         self.remove_metal = remove_metal
+        self.antibody_add_antigen = antibody_add_antigen
+        self.antibody_min_neighborhood = antibody_min_neighborhood
+        self.antibody_max_neighborhood = antibody_max_neighborhood
 
     def random_crop_method(self) -> str:
         """
@@ -589,6 +723,9 @@ class CropData(object):
         Returns:
             selected_indices : torch.Tensor, shape=(N_selected, )
         """
+        if crop_method == "AntibodyCropping":
+            return self.get_antibody_crop_indices()
+
         (
             tokens,
             chain_id,
@@ -658,4 +795,42 @@ class CropData(object):
         return (
             selected_token_indices,
             token_indices_in_ref[reference_token_index].item(),
+        )
+
+    def get_antibody_crop_indices(self) -> tuple[torch.Tensor, int]:
+        """Build per-token arrays and delegate to :func:`get_antibody_crop_index`.
+
+        ``self.ref_chain_indices`` holds the heavy/light ``asym_id_int`` chains. The CDR
+        mask comes from the ``is_cdr_residue`` token annotation when present (i.e. when
+        CDR stripping was enabled during preprocessing), otherwise ``None``.
+        """
+        centre_atom_indices = self.token_array.get_annotation("centre_atom_index")
+        centre_atoms = self.atom_array[centre_atom_indices]
+        chain_id = np.asarray(centre_atoms.asym_id_int)
+        res_id = np.asarray(centre_atoms.res_id)
+        center_coords = np.asarray(self.atom_array.coord[centre_atom_indices])
+        is_resolved = np.asarray(centre_atoms.is_resolved).astype(bool)
+        atom_num = np.array(
+            [len(token.atom_indices) for token in self.token_array], dtype=np.int64
+        )
+
+        is_cdr = None
+        tokens = self.token_array.tokens
+        if len(tokens) and "is_cdr_residue" in tokens[0]._annot:
+            is_cdr = np.asarray(
+                self.token_array.get_annotation("is_cdr_residue")
+            ).astype(bool)
+
+        return get_antibody_crop_index(
+            chain_id=chain_id,
+            res_id=res_id,
+            center_coords=center_coords,
+            atom_num=atom_num,
+            is_resolved=is_resolved,
+            is_cdr=is_cdr,
+            ref_chain_indices=self.ref_chain_indices,
+            crop_size=self.crop_size,
+            add_antigen=self.antibody_add_antigen,
+            min_neighborhood=self.antibody_min_neighborhood,
+            max_neighborhood=self.antibody_max_neighborhood,
         )

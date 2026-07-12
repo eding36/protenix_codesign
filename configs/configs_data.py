@@ -59,6 +59,12 @@ default_weighted_pdb_configs = {
     "cropping_configs": {
         "method_weights": ListValue([0.2, 0.4, 0.4]),
         "crop_size": GlobalConfigValue("train_crop_size"),
+        # Antibody-only crop (used automatically for samples carrying H/L chain roles).
+        # Keeps the whole Fv and, when add_antigen is set, grows a spatial antigen
+        # neighborhood around a CDR anchor (MFDesign AntibodyCropper analog).
+        "antibody_add_antigen": True,
+        "antibody_min_neighborhood": 0,
+        "antibody_max_neighborhood": 40,
     },
     "sample_weight": 0.5,
     "limits": -1,

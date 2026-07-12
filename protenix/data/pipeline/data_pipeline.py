@@ -203,6 +203,41 @@ class DataPipeline(object):
         return bioassembly_dict
 
     @staticmethod
+    def _get_antibody_chains(
+        one_sample: pd.Series, bioassembly_dict: dict[str, Any]
+    ) -> tuple[Optional[int], Optional[int]]:
+        """Read the heavy/light ``asym_id_int`` chains of an antibody sample.
+
+        The ``H_chain_id`` / ``L_chain_id`` columns (asym_id_int values, written by
+        :meth:`get_data_from_mmcif` from the SAbDab roles) are the Protenix analog of
+        MFDesign's ``AntibodyInfo.H_chain_id`` / ``L_chain_id``. Returns ``(None, None)``
+        for non-antibody samples (columns absent or empty), so ordinary complexes fall
+        through to the standard crop path unchanged.
+
+        Args:
+            one_sample (pd.Series): A row from the indices list.
+            bioassembly_dict (dict[str, Any]): The bioassembly dict.
+
+        Returns:
+            tuple[Optional[int], Optional[int]]: (H_chain_id, L_chain_id) as asym_id_int,
+                each ``None`` when missing or not present in the structure.
+        """
+        chain_ids = np.unique(bioassembly_dict["atom_array"].asym_id_int)
+
+        def _parse(field: str) -> Optional[int]:
+            raw = one_sample.get(field, "") if hasattr(one_sample, "get") else ""
+            raw = str(raw).strip()
+            if raw in ("", "nan", "None"):
+                return None
+            try:
+                val = int(float(raw))
+            except (TypeError, ValueError):
+                return None
+            return val if val in chain_ids else None
+
+        return _parse("H_chain_id"), _parse("L_chain_id")
+
+    @staticmethod
     def _map_ref_chain(
         one_sample: pd.Series, bioassembly_dict: dict[str, Any]
     ) -> list[int]:
@@ -309,6 +344,9 @@ class DataPipeline(object):
         spatial_crop_complete_lig: bool = False,
         drop_last: bool = False,
         remove_metal: bool = False,
+        antibody_add_antigen: bool = True,
+        antibody_min_neighborhood: int = 0,
+        antibody_max_neighborhood: int = 40,
     ) -> tuple[str, TokenArray, AtomArray, dict[str, Any], dict[str, Any]]:
         """
         Crop data based on the crop size and reference chain indices.
@@ -357,9 +395,20 @@ class DataPipeline(object):
                 -1,
             )
 
-        ref_chain_indices = DataPipeline._map_ref_chain(
+        # Antibody samples (H/L chain roles present) use a dedicated crop that keeps the
+        # whole Fv and, optionally, a spatial antigen neighborhood -- the MFDesign
+        # AntibodyCropper analog. Ordinary complexes keep the standard weighted methods.
+        h_chain_id, l_chain_id = DataPipeline._get_antibody_chains(
             one_sample=one_sample, bioassembly_dict=bioassembly_dict
         )
+        is_antibody = h_chain_id is not None or l_chain_id is not None
+
+        if is_antibody:
+            ref_chain_indices = [c for c in (h_chain_id, l_chain_id) if c is not None]
+        else:
+            ref_chain_indices = DataPipeline._map_ref_chain(
+                one_sample=one_sample, bioassembly_dict=bioassembly_dict
+            )
 
         crop = CropData(
             crop_size=crop_size,
@@ -371,9 +420,14 @@ class DataPipeline(object):
             spatial_crop_complete_lig=spatial_crop_complete_lig,
             drop_last=drop_last,
             remove_metal=remove_metal,
+            antibody_add_antigen=antibody_add_antigen,
+            antibody_min_neighborhood=antibody_min_neighborhood,
+            antibody_max_neighborhood=antibody_max_neighborhood,
         )
         # Get crop method
-        crop_method = crop.random_crop_method()
+        crop_method = (
+            "AntibodyCropping" if is_antibody else crop.random_crop_method()
+        )
         # Get crop indices based crop method
         selected_indices, reference_token_index = crop.get_crop_indices(
             crop_method=crop_method

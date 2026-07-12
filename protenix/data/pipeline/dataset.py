@@ -609,6 +609,9 @@ class BaseSingleDataset(Dataset):
         spatial_crop_complete_lig: bool = True,
         drop_last: bool = True,
         remove_metal: bool = True,
+        antibody_add_antigen: bool = True,
+        antibody_min_neighborhood: int = 0,
+        antibody_max_neighborhood: int = 40,
     ) -> tuple[str, TokenArray, AtomArray, dict[str, Any], dict[str, Any]]:
         """
         Crops the bioassembly data based on the specified configurations.
@@ -628,6 +631,9 @@ class BaseSingleDataset(Dataset):
             spatial_crop_complete_lig=spatial_crop_complete_lig,
             drop_last=drop_last,
             remove_metal=remove_metal,
+            antibody_add_antigen=antibody_add_antigen,
+            antibody_min_neighborhood=antibody_min_neighborhood,
+            antibody_max_neighborhood=antibody_max_neighborhood,
         )
 
     def _get_sample_indice(self, idx: int) -> pd.Series:
@@ -1156,6 +1162,29 @@ def get_sample_weights(
     elif sampler_type == "uniform":
         assert indices_df is not None
         return [1 / len(indices_df) for _ in range(len(indices_df))]
+    elif sampler_type == "antibody":
+        assert indices_df is not None
+        # Uniform sampling over antibody chains (MFDesign AntibodySampler analog). Its
+        # sampler enumerates one item per valid H/L chain -- (record, H) and (record, L)
+        # -- and draws uniformly with replacement. The mathematically equivalent weight
+        # here is proportional to the number of valid antibody chains a row carries: a
+        # row with both H and L is twice as likely as one with a single chain, and
+        # non-antibody rows (no H/L role) get zero weight so they are never sampled.
+        def _has_chain(col: str) -> np.ndarray:
+            if col not in indices_df.columns:
+                return np.zeros(len(indices_df), dtype=np.float64)
+            vals = indices_df[col].astype(str).str.strip()
+            return (~vals.isin(["", "nan", "None"])).to_numpy(dtype=np.float64)
+
+        chain_counts = _has_chain("H_chain_id") + _has_chain("L_chain_id")
+        total = chain_counts.sum()
+        if total <= 0:
+            logger.warning(
+                "sampler_type='antibody' but no H/L chain roles found in indices; "
+                "falling back to uniform weighting."
+            )
+            return [1 / len(indices_df) for _ in range(len(indices_df))]
+        return (chain_counts / total).astype("float32").tolist()
     else:
         raise ValueError(f"Unknown sampler type: {sampler_type}")
 
