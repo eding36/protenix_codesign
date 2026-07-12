@@ -60,17 +60,27 @@ scripts/msa/step2-get_msa.ipynb
 
 The raw search results should be saved in `scripts/msa/data/mmcif_msa_initial` (default format is `.a3m` files named by index ID, e.g., `0.a3m`).
 
+#### Step 2.5: Filter MSA sequences on CDR sequence similarity
+Since the model is tasked on designing CDR sequences, during model training, MSA inputs should not contain MSA entries with high CDR sequence similarity to the query protein. This causes data leakage.
+
+```bash
+python3 scripts/step2_5_filter_msa_cdr_similarity.py \
+  --input_dir /home/dinge/data/proj/protenix_codesign/data/mmcif_msa_initial \
+  --msa_filtering_threshold 0.2 --num_workers 32 > "$LOG" 2>&1
+```
+
+
 #### Step 3: MSA Post-Processing
 
 This step converts raw A3M files into the final Protenix-compatible format by appending taxonomy IDs and splitting hits.
 
 1. **Append Taxonomy IDs**:
    ```bash
-   python3 scripts/msa/step3-uniref_add_taxid.py
+   python3 scripts/msa/step3-uniref_add_taxid.py --input_msa_dir /home/dinge/data/proj/protenix_codesign/data/mmcif_msa_initial/filtered/ --output_msa_dir /home/dinge/data/proj/protenix_codesign/data/mmcif_msa_with_taxid/ --num_workers 32
    ```
 2. **Split and Organize**:
    ```bash
-   python3 scripts/msa/step4-split_msa_to_uniref_and_others.py --input_msa_dir scripts/msa/data/mmcif_msa_with_taxid --output_msa_dir scripts/msa/data/mmcif_msa
+   python3 scripts/msa/step4-split_msa_to_uniref_and_others.py --input_msa_dir /home/dinge/data/proj/protenix_codesign/data/mmcif_msa_with_taxid/ --output_msa_dir /home/dinge/data/proj/protenix_codesign/data/mmcif_msa/
    ```
 
 The processed MSAs will be saved in `scripts/msa/data/mmcif_msa`, organized by their sequence index.
