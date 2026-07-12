@@ -210,7 +210,7 @@ def add_is_cdr_residue_to_token_array(token_array, atom_array):
 
 
 def load_sabdab_chain_roles(csv_path) -> "dict[str, list[dict]]":
-    """Load H/L/antigen chain roles from MFDesign's processed summary CSV.
+    """Load H/L/antigen:author_chain_ID mappings from MFDesign's processed summary CSV.
 
     Reuses the SAbDab chain identity already curated by MFDesign's step-1
     ``summary.py`` (H/L corrected via abnumber, filtered, deduplicated) instead of
@@ -265,36 +265,19 @@ def load_sabdab_chain_roles(csv_path) -> "dict[str, list[dict]]":
     return roles
 
 
-def _auth_to_asym_int_map(atom_array) -> "dict[str, list[int]]":
-    """Map author chain id -> sorted list of base ``asym_id_int`` chain indices.
-
-    ``asym_id_int`` is Protenix's integer chain index -- the analog of MFDesign's
-    ``enumerate(chains)`` asym_id (mmcif.py:1250-1260). Assembly-expanded copies
-    (chain_id containing ``.``) are skipped so the mapping lands on the base chains.
-    """
-    cats = atom_array.get_annotation_categories()
-    if "auth_asym_id" not in cats or "asym_id_int" not in cats:
-        return {}
-    mapping: dict = {}
-    for auth, label, asym_int in zip(
-        atom_array.auth_asym_id, atom_array.chain_id, atom_array.asym_id_int
-    ):
-        if "." in str(label):
-            continue
-        mapping.setdefault(str(auth), set()).add(int(asym_int))
-    return {k: sorted(v) for k, v in mapping.items()}
-
-
 def resolve_sabdab_roles(
     atom_array, entries: "list[dict]"
 ) -> "tuple[list[int], list[int], list[int]]":
-    """Resolve SAbDab author-chain roles to Protenix ``asym_id_int`` chain indices.
+    """Find the mmCIF chain indices of author_chain_id chains.
 
-    SAbDab records chains by *author* id (e.g. ``H``/``L``/``A``). This maps each to
-    Protenix's integer chain index (``asym_id_int``) via the ``auth_asym_id``
-    annotation -- the direct analog of MFDesign storing the ``enumerate(chains)``
-    asym_id for H/L/antigen (mmcif.py:1250-1260). Chain indices are also what the
-    cropper's ``ref_chain_indices`` expect.
+    SAbDab records chains by *author* id (e.g. ``H``/``L``/``A``), which carries no
+    role information -- the structure only knows a chain called ``H`` exists, not that
+    it is the heavy chain. This function injects that external SAbDab role knowledge and
+    maps each author id to Protenix's integer chain index (``asym_id_int``) via the
+    ``auth_asym_id`` annotation -- the direct analog of MFDesign storing the
+    ``enumerate(chains)`` asym_id for H/L/antigen (mmcif.py:1250-1260). Chain indices are
+    also what the cropper's ``ref_chain_indices`` expect. Assembly-expanded copies
+    (chain_id containing ``.``) are skipped so the mapping lands on the base chains.
 
     Args:
         atom_array: bioassembly AtomArray (must carry ``auth_asym_id`` and
@@ -305,8 +288,20 @@ def resolve_sabdab_roles(
         ``(heavy_idx, light_idx, antigen_idx)`` as lists of int chain indices. Returns
         empty lists when the SAbDab entry cannot be matched to the structure.
     """
-    a2i = _auth_to_asym_int_map(atom_array)
-    if not a2i or not entries:
+    cats = atom_array.get_annotation_categories()
+    if "auth_asym_id" not in cats or "asym_id_int" not in cats or not entries:
+        return [], [], []
+
+    # author chain id -> sorted list of asym_id_int chain indices, base chains only
+    a2i: dict = {}
+    for auth, label, asym_int in zip(
+        atom_array.auth_asym_id, atom_array.chain_id, atom_array.asym_id_int
+    ):
+        if "." in str(label):
+            continue
+        a2i.setdefault(str(auth), set()).add(int(asym_int))
+    a2i = {k: sorted(v) for k, v in a2i.items()}
+    if not a2i:
         return [], [], []
 
     def _map(auth_ids):

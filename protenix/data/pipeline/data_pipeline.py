@@ -73,6 +73,7 @@ class DataPipeline(object):
                 prevent atom-count/reference-conformer leakage of the design target,
                 add a per-atom ``is_cdr`` annotation on the AtomArray and a per-token
                 ``is_cdr_residue`` annotation on the TokenArray. Defaults to False.
+            sabdab_roles (Union[dict, None] = None, optional): Heavy/Light/Antigen chain to author_chain_id mappings
         Returns:
             tuple[list[dict[str, Any]], dict[str, Any]]:
                 sample_indices_list (list[dict[str, Any]]): The sample indices list (each one is a chain or an interface).
