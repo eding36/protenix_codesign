@@ -148,6 +148,13 @@ def filter_records(
     kept = [records[0]]  # query is always retained
     for header, seq in records[1:]:
         aligned = match_columns(seq)
+        # Preserve exact query duplicates. ColabFold a3m repeats the query sequence to
+        # mark the UniRef -> ColabFold-envdb boundary; step3 relies on that second
+        # occurrence to delimit the pairing region. Such a record is identical to the
+        # query (100% CDR identity), so the leakage filter below would otherwise drop it.
+        if aligned == query_seq:
+            kept.append((header, seq))
+            continue
         drop = False
         for (a, b), q_cdr in zip(spans, query_cdrs):
             if calculate_similarity(q_cdr, aligned[a:b]) >= threshold:

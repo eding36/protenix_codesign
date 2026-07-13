@@ -67,6 +67,10 @@ Since the model is tasked on designing CDR sequences, during model training, MSA
 python3 scripts/step2_5_filter_msa_cdr_similarity.py \
   --input_dir /home/dinge/data/proj/protenix_codesign/data/mmcif_msa_initial \
   --msa_filtering_threshold 0.2 --num_workers 32 > "$LOG" 2>&1
+
+python scripts/msa/build_uniref_tax_m8.py \
+  --db_prefix /home/dinge/MMseqs2/ColabFold/uniref30_2202_db \
+  --a3m_dir /home/dinge/data/proj/protenix_codesign/data/mmcif_msa_initial/filtered
 ```
 
 
