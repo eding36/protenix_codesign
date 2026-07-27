@@ -56,6 +56,14 @@ basic_configs = {
 data_configs = {
     # Data
     "train_crop_size": 256,
+    # Antibody-only cropping controls (used by AntibodyCropper for samples carrying
+    # H/L chain roles). Exposed as top-level CLI args so each training stage can set
+    # them, e.g. --antibody_add_antigen false. Referenced via GlobalConfigValue in
+    # configs_data.default_weighted_pdb_configs["cropping_configs"].
+    "antibody_add_antigen": True,
+    "antibody_min_neighborhood": 0,
+    "antibody_max_neighborhood": 40,
+    "antibody_mixed_prob": 0.0,
     "test_max_n_token": -1,
     "train_lig_atom_rename": False,
     "train_shuffle_mols": False,
@@ -405,6 +413,7 @@ loss_configs = {
             "alpha_distogram": 3e-2,
             "alpha_bond": 0.0,  # or 1 in finetuning stages
             "smooth_lddt": 1.0,  # or 0 in finetuning stages
+            "alpha_sequence": 1.0,  # antibody codesign sequence CE loss
         },
         "plddt": {
             "min_bin": 0,

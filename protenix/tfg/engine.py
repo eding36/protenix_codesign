@@ -392,7 +392,7 @@ class TFGEngine:
             if self.cfg.rho != 0.0:
                 with torch.enable_grad():
                     x_var = x_work.detach().requires_grad_(True)
-                    x0_pred = denoise_net(
+                    x0_pred, _ = denoise_net(
                         x_noisy=x_var,
                         t_hat_noise_level=t_hat,
                         input_feature_dict=input_feature_dict,
@@ -431,7 +431,7 @@ class TFGEngine:
             # 2) denoise with the x_t shift applied
             with torch.no_grad():
                 # The denoiser is treated as a black box in this branch.
-                x0 = denoise_net(
+                x0, _ = denoise_net(
                     x_noisy=x_work + xt_shift,
                     t_hat_noise_level=t_hat,
                     input_feature_dict=input_feature_dict,

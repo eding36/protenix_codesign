@@ -36,7 +36,16 @@
     - You can add the `-d` parameter when running the script to skip the CIF file download step, in which case the script will directly process the "components.cif" file located in the "ccd_cache_dir".
 
 ## Data Preprocessing
-Execute the script to preprocess the data:
+Execute the script to preprocess the data to produce the indices.csv file with protein metadata and bioassembly pkl files required for model training.
+
+Optionally, if doing antibody codesign, also removes CDR region side chains and adds {H/L/antigen:chain_id} mappings to the indices csv file. If a pdb file contains multiple antibody-antigen complexes, then the resulting bioassembly.pkl file only contains one H chain, one L chain, and one Ag chain at most:
+
+Bash cmd for antibody codesign set preprocessing:
+```bash
+python3 scripts/prepare_training_data.py -i [/path/to/mfdesign_step6_output/train_entry.json] --complexes_json [/path/to/mfdesign_step1_output/summary.json] --mmcif_dir [/path/to/mfdesign_step1_input/raw_data/cif/] -o [/{PROTENIX_ROOT_DIR}/indices/train_indices.csv] -b [/{PROTENIX_ROOT_DIR}/mmcif_bioassembly] --cif_output_dir [/{PROTENIX_ROOT_DIR}/mmcif/] -c [/path/to/cluster.txt] -n [num_cpu] --strip_antibody_cdr --sabdab_summary [mfdesign_step1_preprocessing_output_summary.csv]
+```
+
+Bash cmd for normal data preprocessing:
 ```bash
 python3 scripts/prepare_training_data.py -i [input_path] -o [output_csv] -b [output_dir] -c [cluster_txt] -n [num_cpu]
 ```

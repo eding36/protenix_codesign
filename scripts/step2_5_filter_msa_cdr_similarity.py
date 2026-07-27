@@ -23,7 +23,7 @@ with Protenix's abnumber-based detection instead of a precomputed ``summary.json
 For every a3m file:
 
   1. The first record is the query. Its CDR1/CDR2/CDR3 spans are computed from the query
-     sequence via :func:`protenix.data.antibody_cdr._chain_residue_cdr_flags`
+     sequence via :func:`protenix.data.antibody_cdr._chain_residue_region_labels`
      (Chothia numbering through abnumber/anarcii). Queries that do not parse as an
      antibody variable domain (i.e. antigen / non-antibody chains, or antibodies with an
      incomplete CDR) are copied through unchanged -- there is nothing to filter.
@@ -61,7 +61,10 @@ from tqdm import tqdm
 # Reuse Protenix's abnumber-based CDR detector so this script stays consistent with the
 # rest of the antibody pipeline (protenix/data/antibody_cdr.py).
 try:
-    from protenix.data.antibody_cdr import _chain_residue_cdr_flags
+    from protenix.data.antibody_cdr import (
+        _CDR_LABEL_SET,
+        _chain_residue_region_labels,
+    )
 except ImportError as e:  # pragma: no cover - environment guard
     print(
         "Error: could not import protenix.data.antibody_cdr. Run this script from the "
@@ -188,7 +191,13 @@ def process_single_a3m(
 
         # CDR detection (abnumber/Chothia). None => not an antibody Fv (antigen or
         # incomplete CDR) => nothing to filter, copy through.
-        flags = _chain_residue_cdr_flags(query_seq, {})
+        # Region labels are 1-7 (fr1..fr4 / cdr1..cdr3), 0 outside the Fv, or None
+        # for a non-antibody chain. Convert to a per-residue CDR bool for span
+        # detection (CDR labels are cdr1/cdr2/cdr3 in _CDR_LABEL_SET).
+        labels = _chain_residue_region_labels(query_seq, {})
+        flags = (
+            [lbl in _CDR_LABEL_SET for lbl in labels] if labels is not None else None
+        )
         spans = cdr_spans_from_flags(flags) if flags else []
         if not spans:
             capped = records if max_seqs is None else records[:max_seqs]

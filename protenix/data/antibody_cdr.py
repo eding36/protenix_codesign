@@ -43,33 +43,55 @@ BACKBONE_CB_ATOMS = frozenset({"N", "CA", "C", "O", "CB"})
 _CHOTHIA_RANGES = ["fr1", "cdr1", "fr2", "cdr2", "fr3", "cdr3", "fr4"]
 _CDR_RANGES = frozenset({"cdr1", "cdr2", "cdr3"})
 
+# Per-region integer labels for the model's ``region_type`` feature. 0 is
+# reserved for "not an antibody Fv position" (padding_idx of the region
+# embedding); antigen tokens are labelled separately in
+# :func:`add_chain_and_region_types_to_token_array`.
+_REGION_LABELS = {name: i + 1 for i, name in enumerate(_CHOTHIA_RANGES)}
+_CDR_LABEL_SET = frozenset(_REGION_LABELS[r] for r in _CDR_RANGES)
+
+# ``chain_type`` / ``region_type`` label values shared with the sequence model
+# (protenix/model/modules/diffusion.py:238-239). 0 = padding.
+CHAIN_TYPE_HEAVY = 1
+CHAIN_TYPE_LIGHT = 2
+CHAIN_TYPE_ANTIGEN = 3
+REGION_TYPE_ANTIGEN = 8  # antigen, non-epitope
+REGION_TYPE_EPITOPE = 9  # antigen residue near the antibody (epitope)
+
+# Antigen residue is an epitope if any of its atoms lies within this distance (A)
+# of any antibody (H/L) atom. Matches MFDesign's default epitope cutoff.
+EPITOPE_DISTANCE_CUTOFF = 10.0
+
 # anarcii is a torch model; instantiate one CPU/single-thread instance and reuse
 # it for every chain to avoid the thread oversubscription that occurs when each
 # call spins up ncpu=-1 threads inside a joblib worker.
 _ANARCII_ARGS = {"cpu": True, "ncpu": 1}
 
 
-def _fv_cdr_mask(chain) -> "tuple[str, list[bool]] | tuple[None, None]":
-    """Return (Fv sequence, per-residue CDR mask) for an abnumber Chain.
+def _fv_region_labels(chain) -> "tuple[str, list[int]] | tuple[None, None]":
+    """Return (Fv sequence, per-residue region labels) for an abnumber Chain.
 
     Faithful to MFDesign ``mask_cdr``: build the Fv sequence by concatenating the
-    Chothia region sequences in order and mark the CDR regions. Returns
-    ``(None, None)`` if any region is empty (incomplete/over-long CDR3), matching
-    MFDesign's behaviour of discarding such chains (here: no stripping).
+    Chothia region sequences in order and label each residue with its region
+    (``_REGION_LABELS``: fr1..fr4 / cdr1..cdr3, 1-7). Returns ``(None, None)`` if
+    any region is empty (incomplete/over-long CDR3), matching MFDesign's behaviour
+    of discarding such chains (here: no stripping).
     """
-    origin, mask = [], []
+    origin, labels = [], []
     for region in _CHOTHIA_RANGES:
         seq = getattr(chain, region + "_seq")
         if len(seq) == 0:
             return None, None
         origin += list(seq)
-        mask += [region in _CDR_RANGES] * len(seq)
-    return "".join(origin), mask
+        labels += [_REGION_LABELS[region]] * len(seq)
+    return "".join(origin), labels
 
 
-def _chain_residue_cdr_flags(struct_seq: str, seq_cache: dict) -> "list[bool] | None":
-    """Map an antibody chain's structure sequence to a per-residue CDR flag list.
+def _chain_residue_region_labels(struct_seq: str, seq_cache: dict) -> "list[int] | None":
+    """Map an antibody chain's structure sequence to a per-residue region-label list.
 
+    Each residue gets its Chothia region label (1-7; see ``_REGION_LABELS``), with
+    0 for positions outside the numbered Fv (constant domain / unnumbered tails).
     Returns ``None`` when the chain is not an antibody variable domain (or cannot
     be numbered), in which case the caller strips nothing for that chain.
     """
@@ -88,15 +110,14 @@ def _chain_residue_cdr_flags(struct_seq: str, seq_cache: dict) -> "list[bool] | 
             anarcii_args=_ANARCII_ARGS,
         )
         if chain.is_heavy_chain() or chain.is_light_chain():
-            fv_seq, cdr_mask = _fv_cdr_mask(chain)
+            fv_seq, region_labels = _fv_region_labels(chain)
             if fv_seq is not None:
                 offset = struct_seq.find(fv_seq)
                 if offset >= 0:
-                    flags = [False] * len(struct_seq)
-                    for i, is_cdr in enumerate(cdr_mask):
-                        if is_cdr:
-                            flags[offset + i] = True
-                    result = flags
+                    labels = [0] * len(struct_seq)
+                    for i, label in enumerate(region_labels):
+                        labels[offset + i] = label
+                    result = labels
                 else:
                     logger.warning(
                         "Antibody Fv sequence not found within chain sequence; "
@@ -117,7 +138,9 @@ def strip_cdr_side_chains(atom_array: AtomArray) -> "tuple[AtomArray, int]":
     backbone + CB atoms. All other atoms/chains are left untouched. A boolean
     per-atom ``is_cdr`` annotation marking atoms that belong to a CDR residue is
     added (set before stripping, so the retained backbone/CB atoms of CDR residues
-    are flagged True).
+    are flagged True). An integer per-atom ``region_label`` annotation is added
+    too (Chothia region 1-7 for Fv positions, 0 elsewhere; see ``_REGION_LABELS``),
+    the basis of the per-token ``region_type`` model feature.
 
     Args:
         atom_array (AtomArray): Bioassembly AtomArray. Must carry ``mol_type``,
@@ -135,6 +158,7 @@ def strip_cdr_side_chains(atom_array: AtomArray) -> "tuple[AtomArray, int]":
 
     keep_mask = np.ones(n_atoms, dtype=bool)
     is_cdr_atom = np.zeros(n_atoms, dtype=bool)
+    region_label_atom = np.zeros(n_atoms, dtype=np.int64)
     seq_cache: dict = {}
 
     chain_ids = atom_array.chain_id
@@ -162,12 +186,15 @@ def strip_cdr_side_chains(atom_array: AtomArray) -> "tuple[AtomArray, int]":
         if len(struct_seq) < 70:
             continue
 
-        cdr_flags = _chain_residue_cdr_flags(struct_seq, seq_cache)
-        if cdr_flags is None:
+        region_labels = _chain_residue_region_labels(struct_seq, seq_cache)
+        if region_labels is None:
             continue
 
-        for (start, stop), is_cdr in zip(residues, cdr_flags):
-            if not is_cdr:
+        for (start, stop), region_label in zip(residues, region_labels): #removing side chain atoms of CDR residues
+            if not region_label:
+                continue
+            region_label_atom[start:stop] = region_label
+            if region_label not in _CDR_LABEL_SET:
                 continue
             is_cdr_atom[start:stop] = True
             for a in range(start, stop):
@@ -177,6 +204,7 @@ def strip_cdr_side_chains(atom_array: AtomArray) -> "tuple[AtomArray, int]":
     n_removed = int((~keep_mask).sum())
 
     atom_array.set_annotation("is_cdr", is_cdr_atom)
+    atom_array.set_annotation("region_label", region_label_atom)
 
     if n_removed == 0:
         return atom_array, 0
@@ -207,6 +235,130 @@ def add_is_cdr_residue_to_token_array(token_array, atom_array):
     is_cdr_residue = [bool(is_cdr_atom[i]) for i in centre_atom_indices]
     token_array.set_annotation("is_cdr_residue", is_cdr_residue)
     return token_array
+
+
+def _antigen_epitope_token_mask(
+    token_array, atom_array, antibody_asym, antigen_asym, cutoff
+) -> "tuple[list[bool], int]":
+    """Per-token epitope flag for antigen tokens.
+
+    An antigen token is an epitope if any of its (resolved) atoms lies within
+    ``cutoff`` A of any (resolved) antibody atom -- the direct analog of MFDesign's
+    :func:`get_epitope_token` all-atom distance test.
+
+    Returns ``(epitope_mask, epitope_count)`` where ``epitope_mask`` is one bool
+    per token (True only for epitope antigen tokens).
+    """
+    n_token = len(token_array.tokens)
+    epitope = [False] * n_token
+    if not antibody_asym or not antigen_asym:
+        return epitope, 0
+
+    coords = np.asarray(atom_array.coord)
+    asym = np.asarray(atom_array.asym_id_int)
+    cats = atom_array.get_annotation_categories()
+    resolved = (
+        np.asarray(atom_array.is_resolved).astype(bool)
+        if "is_resolved" in cats
+        else np.ones(len(atom_array), dtype=bool)
+    )
+    ab_mask = np.isin(asym, list(antibody_asym)) & resolved
+    if not ab_mask.any():
+        return epitope, 0
+
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(coords[ab_mask])
+    centre_atom_indices = token_array.get_annotation("centre_atom_index")
+    count = 0
+    for tok_i, token in enumerate(token_array.tokens):
+        if int(asym[centre_atom_indices[tok_i]]) not in antigen_asym:
+            continue
+        atom_idx = np.asarray(token.atom_indices)
+        tok_resolved = atom_idx[resolved[atom_idx]]
+        if tok_resolved.size == 0:
+            continue
+        # distance_upper_bound -> finite result only when a neighbour is within cutoff
+        d, _ = tree.query(coords[tok_resolved], k=1, distance_upper_bound=cutoff)
+        if np.any(np.isfinite(d)):
+            epitope[tok_i] = True
+            count += 1
+    return epitope, count
+
+
+def add_chain_and_region_types_to_token_array(
+    token_array,
+    atom_array,
+    heavy_ids,
+    light_ids,
+    antigen_ids,
+    epitope_cutoff: float = EPITOPE_DISTANCE_CUTOFF,
+) -> "tuple[object, int]":
+    """Add per-token ``chain_type`` and ``region_type`` annotations to a TokenArray.
+
+    These feed the sequence model's type/region embeddings
+    (protenix/model/modules/diffusion.py:238-239). Labels are assigned per token
+    from its centre atom:
+
+    * ``chain_type``: 1=Heavy, 2=Light, 3=Antigen (from the SAbDab chain roles
+      matched against each token's ``asym_id_int``), 0 for everything else.
+    * ``region_type``: 1-7 for the Chothia Fv regions (from the per-atom
+      ``region_label`` set by :func:`strip_cdr_side_chains`), 8 for non-epitope
+      antigen tokens, 9 for epitope antigen tokens (within ``epitope_cutoff`` of
+      the antibody), 0 otherwise. Antigen wins over any residual ``region_label``.
+
+    The ``region_label`` atom annotation is expected (present when CDR stripping
+    ran); if absent, region defaults to 0 for non-antigen tokens.
+
+    Args:
+        token_array (TokenArray): must carry ``centre_atom_index``.
+        atom_array (AtomArray): must carry ``asym_id_int`` and ``coord`` (and
+            ``region_label`` / ``is_resolved`` when available).
+        heavy_ids, light_ids, antigen_ids: ``asym_id_int`` chain indices for the
+            heavy / light / antigen chains (from :func:`resolve_sabdab_roles`).
+        epitope_cutoff (float): antibody-antigen distance cutoff for epitope tokens.
+
+    Returns:
+        tuple[TokenArray, int]: the TokenArray (with ``chain_type`` and
+        ``region_type``) and the number of epitope antigen tokens found.
+    """
+    centre_atom_indices = token_array.get_annotation("centre_atom_index")
+    asym_id_int = atom_array.asym_id_int
+    has_region_label = "region_label" in atom_array.get_annotation_categories()
+    region_label_atom = atom_array.region_label if has_region_label else None
+
+    heavy_set, light_set, antigen_set = set(heavy_ids), set(light_ids), set(antigen_ids)
+
+    epitope_mask, epitope_count = _antigen_epitope_token_mask(
+        token_array, atom_array, heavy_set | light_set, antigen_set, epitope_cutoff
+    ) #return epitope mask, which labels which residues are epitopes
+
+    chain_type, region_type = [], [] #token level lists of chain and region type 
+    for tok_i, i in enumerate(centre_atom_indices): #iterate through all residues of token_array
+        asym = int(asym_id_int[i]) 
+        #determine what chain type the residue is in
+        if asym in heavy_set: 
+            chain_type.append(CHAIN_TYPE_HEAVY)
+        elif asym in light_set:
+            chain_type.append(CHAIN_TYPE_LIGHT)
+        elif asym in antigen_set:
+            chain_type.append(CHAIN_TYPE_ANTIGEN)
+        else:
+            chain_type.append(0)
+
+        #now populate region_type for each residue
+        if asym in antigen_set: 
+            region_type.append( #check if antigen is an epitope or not with epitope_mask
+                REGION_TYPE_EPITOPE if epitope_mask[tok_i] else REGION_TYPE_ANTIGEN
+            )
+        elif region_label_atom is not None:
+            region_type.append(int(region_label_atom[i]))
+        else:
+            region_type.append(0)
+
+    token_array.set_annotation("chain_type", chain_type)
+    token_array.set_annotation("region_type", region_type)
+    return token_array, epitope_count
 
 
 def load_sabdab_chain_roles(csv_path) -> "dict[str, list[dict]]":

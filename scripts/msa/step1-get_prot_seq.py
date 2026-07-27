@@ -33,9 +33,16 @@ def get_seqs(mmcif_file):
     if entity_poly is None:
         pdb_id = mmcif_file.name.split(".")[0]
         return pdb_id, None
-    entity_poly["mmcif_seq_old"] = entity_poly.pdbx_seq_one_letter_code_can.str.replace(
-        "\n", ""
-    )
+    # Official RCSB mmCIFs carry the canonical one-letter sequence here, used only
+    # as a reference for the declared-vs-atom-site diff flag. Protenix-written CIFs
+    # (e.g. trimmed per-complex outputs) omit it -- the real sequence is rebuilt
+    # from entity_poly_seq below -- so default the reference to empty when absent.
+    if "pdbx_seq_one_letter_code_can" in entity_poly.columns:
+        entity_poly["mmcif_seq_old"] = (
+            entity_poly.pdbx_seq_one_letter_code_can.str.replace("\n", "")
+        )
+    else:
+        entity_poly["mmcif_seq_old"] = ""
     entity_poly["pdbx_type"] = entity_poly.type
     mol_type = []
     # https://mmcif.wwpdb.org/dictionaries/mmcif_pdbx_v50.dic/Items/_entity_poly.type.html

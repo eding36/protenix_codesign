@@ -22,12 +22,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from protenix.data.constants import PRO_STD_RESIDUES, STD_RESIDUES_WITH_GAP
 from protenix.model import sample_confidence
 from protenix.model.generator import (
     InferenceNoiseScheduler,
     sample_diffusion,
     sample_diffusion_training,
     TrainingNoiseSampler,
+    SequenceNoiseSampler
 )
 from protenix.model.modules.confidence import ConfidenceHead
 from protenix.model.modules.diffusion import DiffusionModule
@@ -105,15 +107,42 @@ class Protenix(nn.Module):
         self.N_cycle = self.configs.model.N_cycle
         self.N_model_seed = self.configs.model.N_model_seed
         self.train_confidence_only = configs.train_confidence_only
+        self.sequence_train = configs.model.diffusion_module.sequence_train
         if self.train_confidence_only:  # the final finetune stage
             assert configs.loss.weight.alpha_diffusion == 0.0
             assert configs.loss.weight.alpha_distogram == 0.0
 
         # Diffusion scheduler
         self.train_noise_sampler = TrainingNoiseSampler(**configs.train_noise_sampler)
+        if self.sequence_train:
+            self.seq_noise_type = configs.model.diffusion_module.sequence_noise_type
+            self.n_steps_seq = configs.model.diffusion_module.N_steps_seq
+            # Sequence D3PM corrupter (MFDesign Masker analog). N_tokens is the
+            # restype vocab width (STD_RESIDUES_WITH_GAP=32), the one-hot width the
+            # masked sequence is expanded to; noise_token_id is protein UNK.
+            self.cdr_corrupter = SequenceNoiseSampler(
+                noise_token_id=PRO_STD_RESIDUES["UNK"],
+                N_tokens=len(STD_RESIDUES_WITH_GAP),
+                timesteps=self.n_steps_seq,
+                noise_type=self.seq_noise_type,
+            )
         self.inference_noise_scheduler = InferenceNoiseScheduler(
             **configs.inference_noise_scheduler
         )
+        # Gamma-adjusted inference noise schedule used to COUPLE the structure noise
+        # level to the sequence timestep during discrete codesign training
+        # (MFDesign): sigma = seq_sigma_schedule[T-1-t]. Length n_steps_seq.
+        self.seq_sigma_schedule = None
+        if self.sequence_train and self.seq_noise_type != "continuous":
+            _sigmas = self.inference_noise_scheduler(N_step=self.n_steps_seq)  # [T+1]
+            _g0 = self.configs.sample_diffusion.get("gamma0")
+            _gmin = self.configs.sample_diffusion.get("gamma_min")
+            _gammas = torch.where(
+                _sigmas > _gmin,
+                torch.full_like(_sigmas, _g0),
+                torch.zeros_like(_sigmas),
+            )
+            self.seq_sigma_schedule = _sigmas[:-1] * (1 + _gammas[1:])  # [n_steps_seq]
         self.diffusion_batch_size = self.configs.diffusion_batch_size
 
         # Model
@@ -303,12 +332,15 @@ class Protenix(nn.Module):
 
         return s_inputs, s, z
 
-    def sample_diffusion(self, **kwargs: Any) -> torch.Tensor:
+    def sample_diffusion(
+        self, **kwargs: Any
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Samples diffusion process based on the provided configurations.
 
         Returns:
-            torch.Tensor: The result of the diffusion sampling process.
+            tuple[torch.Tensor, Optional[torch.Tensor]]: the denoised coordinates
+            and the final-step sequence prediction (None unless sequence_train).
         """
         _configs = {
             key: self.configs.sample_diffusion.get(key)
@@ -423,6 +455,8 @@ class Protenix(nn.Module):
                 "pde": _cat(pred_dicts, "pde"),
                 "resolved": _cat(pred_dicts, "resolved"),
             }
+            if self.sequence_train:
+                all_pred_dict["sequence"] = _cat(pred_dicts, "sequence")
 
             all_log_dict = simple_merge_dict_list(log_dicts)
             all_time_dict = simple_merge_dict_list(time_trackers)
@@ -559,7 +593,18 @@ class Protenix(nn.Module):
         else:
             cache["pair_z"] = None
             cache["p_lm/c_l"] = [None, None]
-        pred_dict["coordinate"] = self.sample_diffusion(
+        # Antibody codesign: run the iterative sequence D3PM rollout alongside the
+        # coordinate sampler. Off (no kwargs) for non-sequence models -> coords only.
+        seq_diffusion_kwargs = {}
+        if self.sequence_train:
+            seq_diffusion_kwargs = dict(
+                sequence_train=True,
+                cdr_corrupter=self.cdr_corrupter,
+                noise_type=self.seq_noise_type,
+                restype_offset=self.c_s,
+                restype_width=len(STD_RESIDUES_WITH_GAP),
+            )
+        pred_dict["coordinate"], seq_denoised = self.sample_diffusion(
             denoise_net=self.diffusion_module,
             input_feature_dict=input_feature_dict,
             s_inputs=s_inputs,
@@ -572,7 +617,14 @@ class Protenix(nn.Module):
             noise_schedule=noise_schedule,
             inplace_safe=inplace_safe,
             enable_efficient_fusion=self.enable_efficient_fusion,
+            **seq_diffusion_kwargs,
         )
+        if self.sequence_train:
+            # seq_denoised is the decoded designed sequence (token ids) [N_token].
+            pred_dict["sequence"] = seq_denoised
+            # Ground truth + design mask so the dumper can report AAR.
+            pred_dict["seq_gt"] = input_feature_dict["seq"]
+            pred_dict["cdr_mask"] = input_feature_dict["cdr_mask"]
 
         step_diffusion = time.time()
         time_tracker.update({"diffusion": step_diffusion - step_trunk})
@@ -680,7 +732,6 @@ class Protenix(nn.Module):
             tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
                 Prediction, updated label, and log dictionaries.
         """
-
         s_inputs, s, z = self.get_pairformer_output(
             input_feature_dict=input_feature_dict,
             N_cycle=N_cycle,
@@ -725,7 +776,7 @@ class Protenix(nn.Module):
             ]  # =1
             N_step_mini_rollout = self.configs.sample_diffusion["N_step_mini_rollout"]
             self.diffusion_module.eval()  # use eval mode for mini-rollout
-            coordinate_mini = self.sample_diffusion(
+            coordinate_mini, _ = self.sample_diffusion(
                 denoise_net=self.diffusion_module,
                 input_feature_dict=input_feature_dict,
                 s_inputs=s_inputs.detach(),
@@ -803,10 +854,11 @@ class Protenix(nn.Module):
         drop_conditioning = (
             random.random() < self.configs.model.condition_embedding_drop_rate
         )
-        _, x_denoised, x_noise_level = autocasting_disable_decorator(
+        _, x_denoised, k_denoised, x_noise_level = autocasting_disable_decorator(
             self.configs.skip_amp.sample_diffusion_training
         )(sample_diffusion_training)(
             noise_sampler=self.train_noise_sampler,
+            cdr_corrupter=self.cdr_corrupter,
             denoise_net=self.diffusion_module,
             label_dict=label_dict,
             input_feature_dict=input_feature_dict,
@@ -816,10 +868,16 @@ class Protenix(nn.Module):
             pair_z=cache["pair_z"],
             p_lm=cache["p_lm/c_l"][0],
             c_l=cache["p_lm/c_l"][1],
+            c_s=self.c_s,
+            N_tokens=len(STD_RESIDUES_WITH_GAP),
             N_sample=N_sample,
             diffusion_chunk_size=self.configs.diffusion_chunk_size,
             use_conditioning=not drop_conditioning,
             enable_efficient_fusion=self.enable_efficient_fusion,
+            sequence_train = self.sequence_train,
+            noise_type = self.seq_noise_type,
+            n_steps_seq = self.n_steps_seq,
+            seq_sigma_schedule = self.seq_sigma_schedule
         )
         pred_dict.update(
             {
@@ -831,6 +889,8 @@ class Protenix(nn.Module):
                 "noise_level": x_noise_level,
             }
         )
+        if self.sequence_train:
+                pred_dict["sequence"] = k_denoised
 
         # Permute symmetric atom/chain in each sample to match true structure
         # Note: currently chains cannot be permuted since label is cropped

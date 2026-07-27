@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Union
+from typing import Optional, Union, Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from protenix.model.modules.embedders import FourierEmbedding, RelativePositionEncoding
 from protenix.model.modules.primitives import LinearNoBias, Transition
@@ -227,8 +228,59 @@ class DiffusionSchedule:
         )
         return inference_noise_schedule
 
+class SequenceD3PM(nn.Module):
+    def __init__(
+        self, 
+        hidden_dim, 
+        vocab_size,
+        dropout
+    ):
+        super().__init__()
+        self.type_embed = nn.Embedding(4, hidden_dim, padding_idx=0) # 1: Heavy, 2: Light, 3: Ag
+        self.region_embed = nn.Embedding(10, hidden_dim, padding_idx=0)
+        self.proj = nn.Sequential(
+            nn.Linear(3 * hidden_dim, 2 * hidden_dim), nn.GELU(),
+            nn.Linear(2 * hidden_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.LayerNorm = nn.LayerNorm(hidden_dim, eps=1e-12)
+        self.encoder = nn.Sequential(
+            nn.Linear(hidden_dim, 2 * hidden_dim),
+            nn.GELU(),
+            nn.Linear(2 * hidden_dim, hidden_dim),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim, 2 * hidden_dim),
+            nn.GELU(),
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, vocab_size)
+        )
+                
+          
+    def forward(self, res_feat, cond = None):
+        """Denoise the sequence feature.
 
+        Args:
+            res_feat: The sequence feature. 
+
+            cond: The condition feature.
+
+        Returns:
+            res (batch_size, max_tokens, vocab_size): The denoised sequence one-hot code.
+        """
+        res = self.encoder(res_feat)
+        type_embed = self.type_embed(cond["type"])
+        region_embed = self.region_embed(cond["region"])
+        res = torch.cat([res, type_embed, region_embed], dim=-1)
+        res = self.dropout(self.LayerNorm(self.proj(res)))
+        res = self.decoder(res)
+        return res
+    
 class DiffusionModule(nn.Module):
+    #Oneshot denoising from T -> 0
     """
     Implements Algorithm 20 in AF3
 
@@ -270,6 +322,10 @@ class DiffusionModule(nn.Module):
         drop_path_rate: float = 0.0,
         blocks_per_ckpt: Optional[int] = None,
         use_fine_grained_checkpoint: bool = False,
+        sequence_train: bool = False,
+        sequence_model_args: Optional[dict[str, Any]] = None,
+        sequence_noise_type: str = "discrete_uniform",
+        N_steps_seq: int = 200,
     ) -> None:
         super(DiffusionModule, self).__init__()
         self.sigma_data = sigma_data
@@ -297,6 +353,16 @@ class DiffusionModule(nn.Module):
             c_z=c_z,
             blocks_per_ckpt=blocks_per_ckpt,
         )
+        """Sequence denoising head, codesign implementation"""
+        self.sequence_train = sequence_train
+        self.sequence_noise_type = sequence_noise_type
+        self.N_steps_seq = N_steps_seq
+        if sequence_train:
+            if sequence_model_args is None:
+                raise ValueError("sequence model args must be provided when training sequence model")
+            self.sequence_model = SequenceD3PM(
+                **sequence_model_args
+            )
         # Alg20: line4
         self.layernorm_s = LayerNorm(c_s, create_offset=False)
         self.linear_no_bias_s = LinearNoBias(
@@ -477,6 +543,24 @@ class DiffusionModule(nn.Module):
         )
 
         a_token = self.layernorm_a(a_token)
+        """Sequence denoising"""
+        if self.sequence_train:
+            cond = {}
+            # Expand the per-token conditioning to a_token's N_sample dim
+            # (a_token is [..., N_sample, N_token, c_token]) so the type/region
+            # embeddings concatenate cleanly inside SequenceD3PM. MFDesign achieves
+            # the same via repeat_interleave(multiplicity) after flattening
+            # batch*multiplicity; Protenix keeps N_sample as a separate axis.
+            N_sample = a_token.shape[-3]
+            cond["type"] = expand_at_dim(
+                input_feature_dict["chain_type"], dim=-2, n=N_sample
+            )  # [..., N_sample, N_token]
+            cond["region"] = expand_at_dim(
+                input_feature_dict["region_type"], dim=-2, n=N_sample
+            )  # [..., N_sample, N_token]
+            k_denoised = self.sequence_model(a_token, cond)
+        else:
+            k_denoised = None
 
         # Fine-grained checkpoint for finetuning stage 2 (token num: 768) for avoiding OOM
         if blocks_per_ckpt and self.use_fine_grained_checkpoint:
@@ -502,8 +586,9 @@ class DiffusionModule(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
-
-        return r_update
+        # k_denoised is the sequence-model output when sequence_train, else None.
+        # Always return the pair so callers need no branching on return arity.
+        return r_update, k_denoised
 
     def forward(
         self,
@@ -562,7 +647,7 @@ class DiffusionModule(nn.Module):
         # Compute the update given r_noisy (the scaled x_noisy)
         # As in EDM:
         #     r_update = F(r_noisy, c_noise(sigma))
-        r_update = self.f_forward(
+        r_update, k_denoised = self.f_forward(
             r_noisy=r_noisy,
             t_hat_noise_level=t_hat_noise_level,
             input_feature_dict=input_feature_dict,
@@ -577,6 +662,7 @@ class DiffusionModule(nn.Module):
             use_conditioning=use_conditioning,
             enable_efficient_fusion=enable_efficient_fusion,
         )
+
 
         # Rescale updates to positions and combine with input positions
         # As in EDM:
@@ -596,5 +682,6 @@ class DiffusionModule(nn.Module):
             / torch.sqrt(1 + s_ratio**2)
             * r_update
         ).to(r_update.dtype)
-
-        return x_denoised
+        # k_denoised is the sequence-model output when sequence_train, else None.
+        # Always return the pair so callers need no branching on return arity.
+        return x_denoised, k_denoised

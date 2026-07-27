@@ -25,6 +25,7 @@ import torch
 from biotite.structure import AtomArray
 
 from protenix.data.antibody_cdr import (
+    add_chain_and_region_types_to_token_array,
     add_is_cdr_residue_to_token_array,
     resolve_sabdab_roles,
     strip_cdr_side_chains,
@@ -148,6 +149,29 @@ class DataPipeline(object):
                     heavy_ids, light_ids, antigen_ids = resolve_sabdab_roles(
                         atom_array, entries
                     )
+                    # Bake per-token chain_type (H/L/Ag) and region_type (Chothia
+                    # Fv regions + antigen/epitope) onto the token array so the
+                    # sequence model's type/region embeddings can read them after
+                    # cropping. Also returns the epitope token count.
+                    token_array, epitope_count = (
+                        add_chain_and_region_types_to_token_array(
+                            token_array,
+                            atom_array,
+                            heavy_ids,
+                            light_ids,
+                            antigen_ids,
+                        )
+                    )
+                    bioassembly_dict["token_array"] = token_array
+                    # MFDesign-style epitope gate: an antibody-antigen complex with
+                    # no antigen residue within the epitope cutoff carries no usable
+                    # epitope signal for codesign -- drop it (no samples emitted).
+                    if antigen_ids and epitope_count == 0:
+                        logger.warning(
+                            "No epitope residues within cutoff for %s; skipping.",
+                            bioassembly_dict["pdb_id"],
+                        )
+                        return [], bioassembly_dict
             for row in sample_indices_list:
                 # Single-antibody assumption: first heavy/light chain. Values are
                 # asym_id_int chain indices (MFDesign-style), not label chain ids.
@@ -347,6 +371,7 @@ class DataPipeline(object):
         antibody_add_antigen: bool = True,
         antibody_min_neighborhood: int = 0,
         antibody_max_neighborhood: int = 40,
+        antibody_mixed_prob: float = 1.0,
     ) -> tuple[str, TokenArray, AtomArray, dict[str, Any], dict[str, Any]]:
         """
         Crop data based on the crop size and reference chain indices.
@@ -363,6 +388,11 @@ class DataPipeline(object):
             spatial_crop_complete_lig (bool): Whether to crop the complete ligand in SpatialCropping method.
             drop_last (bool): Whether to drop the last fragment in ContiguousCropping.
             remove_metal (bool): Whether to remove metal atoms from the crop.
+            antibody_mixed_prob (float): For antibody samples, the probability of using
+                the standard weighted crop (anywhere in the complex); with probability
+                ``1 - antibody_mixed_prob`` the sample uses the antibody-centered
+                AntibodyCropping. Defaults to 0.0 (always AntibodyCropping).
+                MFDesign stage-4 MixedCropper ``probability: 0.5`` == 0.5 here.
 
         Returns:
             tuple[str, TokenArray, AtomArray, dict[str, Any], dict[str, Any]]:
@@ -403,7 +433,18 @@ class DataPipeline(object):
         )
         is_antibody = h_chain_id is not None or l_chain_id is not None
 
-        if is_antibody:
+        # MFDesign MixedCropper analog: ``antibody_mixed_prob`` is the probability that
+        # an antibody sample uses the standard weighted crop (seeded like an ordinary
+        # complex -- a crop from anywhere in the complex, not forced around the Fv);
+        # with probability ``1 - antibody_mixed_prob`` it uses the antibody-centered
+        # AntibodyCropping. ``antibody_mixed_prob=0.0`` (the default) reproduces the
+        # previous always-AntibodyCropping behaviour (MFDesign stages 1-3); MFDesign's
+        # stage-4 ``MixedCropper(probability=0.5)`` maps to ``antibody_mixed_prob=0.5``.
+        use_antibody_crop = is_antibody and (
+            antibody_mixed_prob <= 0.0 or np.random.random() >= antibody_mixed_prob
+        )
+
+        if use_antibody_crop:
             ref_chain_indices = [c for c in (h_chain_id, l_chain_id) if c is not None]
         else:
             ref_chain_indices = DataPipeline._map_ref_chain(
@@ -426,7 +467,7 @@ class DataPipeline(object):
         )
         # Get crop method
         crop_method = (
-            "AntibodyCropping" if is_antibody else crop.random_crop_method()
+            "AntibodyCropping" if use_antibody_crop else crop.random_crop_method()
         )
         # Get crop indices based crop method
         selected_indices, reference_token_index = crop.get_crop_indices(

@@ -86,6 +86,31 @@ model_configs = {
             "N_step": 200,
         },
     },
+    "protenix_base_default_v1.0.0_codesign": {
+        "model": {
+            "N_cycle": 10,
+            "template_embedder": {
+                "n_blocks": 2,
+            },
+            "diffusion_module": {
+                "sequence_train": True,
+                "sequence_noise_type": "discrete_uniform",
+                "N_steps_seq": 200,
+                "sequence_model_args": {
+                    "hidden_dim": 768,
+                    "vocab_size": 20,
+                    "dropout": 0.1
+                }
+            }
+        },
+        # Finetuning from the base checkpoint, which lacks the codesign sequence
+        # head (diffusion_module.sequence_model.*). Load non-strictly so those new
+        # params keep their init instead of raising "Missing key(s)".
+        "load_strict": False,
+        "sample_diffusion": {
+            "N_step": 200,
+        },  # the default inference setting for base model
+    },
     "protenix_base_default_v1.0.0": {
         "model": {
             "N_cycle": 10,

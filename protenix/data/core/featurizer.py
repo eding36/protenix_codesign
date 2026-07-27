@@ -324,7 +324,37 @@ class Featurizer(object):
         centre_atoms = self.cropped_atom_array[centre_atoms_indices]
 
         restype = centre_atoms.cano_seq_resname
-        restype_onehot = self.restype_onehot_encoded(restype)
+        restype_onehot = self.restype_onehot_encoded(restype)  # clean one-hot
+
+        n_token = len(self.cropped_token_array)
+        token_annots = (
+            self.cropped_token_array.tokens[0]._annot if n_token else {}
+        )
+
+        # Antibody codesign, MFDesign-style two-stage sequence masking.
+        #   `seq`      : clean integer token ids captured BEFORE masking -- the
+        #                diffusion masker input and the sequence CE target
+        #                (MFDesign's unmask_res_type).
+        #   `cdr_mask` : designable / CDR tokens (from the is_cdr_residue
+        #                annotation); the sites that get UNK-masked here and later
+        #                diffusion-corrupted (MFDesign's cdr_token_mask).
+        # Stage 1 (static): overwrite CDR tokens with UNK in `restype` so the trunk
+        # / s_inputs never see true CDR identity, regardless of diffusion timestep.
+        # Stage 2 (per-timestep corruption of `seq` -> masked_seq) happens later in
+        # the diffusion module. Non-antibody data has no is_cdr_residue annotation,
+        # so nothing is masked and the extra features carry harmless defaults.
+        token_features["seq"] = restype_onehot.argmax(dim=-1)  # [N_token] clean ids
+        if "is_cdr_residue" in token_annots:
+            cdr_mask = torch.tensor(
+                self.cropped_token_array.get_annotation("is_cdr_residue"),
+                dtype=torch.bool,
+            )
+        else:
+            cdr_mask = torch.zeros(n_token, dtype=torch.bool)
+        token_features["cdr_mask"] = cdr_mask
+        unk_index = STD_RESIDUES_WITH_GAP["UNK"]
+        restype_onehot[cdr_mask] = 0.0 #set CDR residues to 0 ("masking")
+        restype_onehot[cdr_mask, unk_index] = 1.0 #set these residues to "UNK" one hot encoding
 
         token_features["token_index"] = torch.arange(0, len(self.cropped_token_array))
         token_features["residue_index"] = torch.from_numpy(
@@ -339,7 +369,20 @@ class Featurizer(object):
         token_features["sym_id"] = torch.from_numpy(
             centre_atoms.sym_id_int.astype(np.int64)
         )
-        token_features["restype"] = restype_onehot
+        token_features["restype"] = restype_onehot  # UNK-masked at CDR tokens
+
+        # Antibody codesign: per-token chain_type (0=pad,1=Heavy,2=Light,3=Ag) and
+        # region_type (0=pad, 1-7 Chothia Fv regions, 8=antigen) feed the sequence
+        # model's type/region embeddings (diffusion.py SequenceD3PM); non-antibody
+        # tokens default to 0 so the feature is always present.
+        for feat_name in ("chain_type", "region_type"):
+            if feat_name in token_annots:
+                token_features[feat_name] = torch.tensor(
+                    self.cropped_token_array.get_annotation(feat_name),
+                    dtype=torch.long,
+                )
+            else:
+                token_features[feat_name] = torch.zeros(n_token, dtype=torch.long)
 
         return token_features
 

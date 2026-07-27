@@ -423,6 +423,7 @@ def get_antibody_crop_index(
     min_neighborhood: int = 0,
     max_neighborhood: int = 40,
     max_atoms: Optional[int] = None,
+    is_fv: Optional[np.ndarray] = None,
 ) -> tuple[torch.Tensor, int]:
     """Antibody-centric crop (ported from MFDesign ``AntibodyCropper``).
 
@@ -462,14 +463,33 @@ def get_antibody_crop_index(
 
     cropped: set[int] = set()
     total_atoms = 0
-    #add all Fv region to crop
+    # Add the antibody variable domain (Fv). When a per-token Fv mask is available
+    # (region_type 1-7), keep only the Fv; otherwise fall back to the whole resolved chain.
     for c in ref_chain_indices:
         sel = (chain_id == c) & is_resolved
+        if is_fv is not None:
+            sel = sel & is_fv
         cropped.update(all_idx[sel].tolist())
         total_atoms += int(atom_num[sel].sum())
 
     if not cropped:
         raise ValueError("No resolved antibody (H/L) tokens to crop")
+
+    # If the antibody alone still exceeds the crop budget (e.g. very long CDR-H3
+    # or an untrimmed constant domain when no Fv mask exists), keep every CDR token
+    # and fill the remaining budget with framework tokens in sequence order, so the
+    # CDRs the model must design are never dropped.
+    if len(cropped) > crop_size:
+        idx_arr = np.array(sorted(cropped))
+        if is_cdr is not None:
+            cdr_first = idx_arr[is_cdr[idx_arr]]
+            fr_rest = idx_arr[~is_cdr[idx_arr]]
+        else:
+            cdr_first = idx_arr[:0]
+            fr_rest = idx_arr
+        keep = np.concatenate([cdr_first, fr_rest])[:crop_size]
+        cropped = set(int(i) for i in keep)
+        total_atoms = int(atom_num[list(cropped)].sum())
 
     reference_token_index = -1
     antigen_mask = (~np.isin(chain_id, ref_chain_indices)) & is_resolved
@@ -815,11 +835,17 @@ class CropData(object):
         )
 
         is_cdr = None
+        is_fv = None
         tokens = self.token_array.tokens
         if len(tokens) and "is_cdr_residue" in tokens[0]._annot:
             is_cdr = np.asarray(
                 self.token_array.get_annotation("is_cdr_residue")
             ).astype(bool)
+        # Fv mask from region_type (1-7 = Chothia Fv regions); lets the cropper keep
+        # only the variable domain instead of the whole antibody chain.
+        if len(tokens) and "region_type" in tokens[0]._annot:
+            region_type = np.asarray(self.token_array.get_annotation("region_type"))
+            is_fv = (region_type >= 1) & (region_type <= 7)
 
         return get_antibody_crop_index(
             chain_id=chain_id,
@@ -833,4 +859,5 @@ class CropData(object):
             add_antigen=self.antibody_add_antigen,
             min_neighborhood=self.antibody_min_neighborhood,
             max_neighborhood=self.antibody_max_neighborhood,
+            is_fv=is_fv,
         )

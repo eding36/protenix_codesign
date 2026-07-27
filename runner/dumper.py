@@ -164,6 +164,14 @@ class DataDumper:
             seed=seed,
             sorted_indices=sorted_indices,
         )
+        # Dump designed sequence (antibody codesign); no-op for non-sequence models.
+        self._save_sequence(
+            data=pred_dict,
+            prediction_save_dir=prediction_save_dir,
+            sample_name=pdb_id,
+            seed=seed,
+            sorted_indices=sorted_indices,
+        )
 
     def _save_structure(
         self,
@@ -209,6 +217,69 @@ class DataDumper:
                 entity_poly_type=entity_poly_type,
                 pdb_id=sample_name,
             )
+
+    def _save_sequence(
+        self,
+        data: dict,
+        prediction_save_dir: str,
+        sample_name: str,
+        seed: int,
+        sorted_indices: Optional[List[int]],
+    ):
+        """Write the designed antibody sequence(s) to FASTA + a ``.seq`` TSV.
+
+        Only runs for antibody-codesign predictions (``data["sequence"]`` present,
+        holding decoded token ids). When ground truth (``seq_gt``) and the design
+        mask (``cdr_mask``) are available, per-CDR / total / heavy / light amino-acid
+        recovery (AAR) is reported alongside each sequence, MFDesign-style.
+        """
+        seq = data.get("sequence", None)
+        if seq is None:
+            return
+        from protenix.metrics.sequence_recovery import calculate_aar
+        from protenix.model.sequence_decode import token_ids_to_letters
+
+        if seq.dim() == 1:
+            seq = seq.unsqueeze(0)  # [1, N_token] -> one design
+        n_designs = seq.shape[0]
+        gt = data.get("seq_gt", None)
+        cdr = data.get("cdr_mask", None)
+        has_gt = gt is not None and cdr is not None
+        order = (
+            sorted_indices
+            if (sorted_indices is not None and len(sorted_indices) == n_designs)
+            else list(range(n_designs))
+        )
+
+        fasta_path = os.path.join(
+            prediction_save_dir, f"{sample_name}_seed_{seed}.fasta"
+        )
+        seq_path = os.path.join(prediction_save_dir, f"{sample_name}_seed_{seed}.seq")
+        seq_lines, fasta_lines = {}, {}
+        for i in range(n_designs):
+            rank = int(order[i])
+            letters = token_ids_to_letters(seq[i])
+            fasta_lines[rank] = f">{sample_name}_rank_{rank}\n{letters}\n"
+            if has_gt:
+                aar = calculate_aar(seq[i], gt, cdr)
+                per = "\t".join(f"{a:.3f}" for a in aar["per_cdr"])
+                seq_lines[rank] = (
+                    f"{rank}\t{letters}\t{aar['total']:.3f}\t{aar['heavy']:.3f}\t"
+                    f"{aar['light']:.3f}\t{per}\n"
+                )
+            else:
+                seq_lines[rank] = f"{rank}\t{letters}\n"
+
+        header = (
+            "Rank\tSequence\tTotal\tH\tL\tPerCDR\n" if has_gt else "Rank\tSequence\n"
+        )
+        with open(fasta_path, "w") as f:
+            for k in sorted(fasta_lines):
+                f.write(fasta_lines[k])
+        with open(seq_path, "w") as f:
+            f.write(header)
+            for k in sorted(seq_lines):
+                f.write(seq_lines[k])
 
     def _get_ranker_indices(self, data: dict) -> List[int]:
         """

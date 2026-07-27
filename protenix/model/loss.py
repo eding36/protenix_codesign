@@ -1438,6 +1438,69 @@ class PLDDTLoss(nn.Module):
 
         return loss
 
+class SequenceLoss(nn.Module):
+    """Cross-entropy loss on designed (CDR) residues for antibody codesign.
+
+    Mirrors MFDesign's sequence loss (boltz diffusion.py:866-886): compares the
+    sequence model's per-token logits (``pred_dict["sequence"]`` == ``k_denoised``)
+    against the ground-truth token ids (``feats["seq"]``), restricted to standard
+    amino-acid tokens inside the design region.
+
+    Vocab note: Protenix amino acids already occupy ids 0-19 (``PRO_STD_RESIDUES``)
+    matching the ``vocab_size=20`` sequence head, so -- unlike MFDesign's boltz
+    vocab where amino acids are ids 2-21 -- no index shift is applied.
+    """
+
+    # Standard amino-acid token id range in STD_RESIDUES_WITH_GAP (ALA=0 .. VAL=19).
+    _AA_MIN = 0
+    _AA_MAX = 19
+
+    def forward(
+        self,
+        denoised_seqs: torch.Tensor,
+        seqs_ground_truth: torch.Tensor,
+        seq_masks: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        Args:
+            denoised_seqs (torch.Tensor): predicted per-token logits.
+                [..., N_sample, N_token, vocab_size]
+            seqs_ground_truth (torch.Tensor): ground-truth token ids.
+                [..., N_token]
+            seq_masks (torch.Tensor): design-region mask (``cdr_mask`` for
+                discrete_uniform, ``seq_mask`` for discrete_absorb).
+                [..., N_token]
+
+        Returns:
+            tuple[torch.Tensor, dict[str, torch.Tensor]]: (loss, {"seq_acc": acc}).
+        """
+        # Broadcast GT/mask across any leading sample dims of the prediction so the
+        # boolean masks line up with denoised_seqs[..., :-1].
+        gt = seqs_ground_truth
+        mask = seq_masks
+        while gt.dim() < denoised_seqs.dim() - 1:
+            gt = gt.unsqueeze(-2)
+            mask = mask.unsqueeze(-2)
+        gt = gt.expand(denoised_seqs.shape[:-1])
+        mask = mask.expand(denoised_seqs.shape[:-1])
+
+        # Standard amino-acid tokens inside the design region only.
+        valid_mask = (gt >= self._AA_MIN) & (gt <= self._AA_MAX) & mask.bool()
+        denoised_filtered = denoised_seqs[valid_mask]  # [n_valid, vocab_size]
+        gt_filtered = gt[valid_mask]  # [n_valid]; already 0-19, no shift
+
+        loss_fct = nn.CrossEntropyLoss(reduction="mean")
+        if denoised_filtered.numel() > 0:
+            seq_loss = loss_fct(denoised_filtered, gt_filtered)
+            seq_acc = (
+                denoised_filtered.argmax(dim=-1) == gt_filtered
+            ).float().mean()
+        else:
+            # No designable tokens in this batch: keep the grad path alive.
+            seq_loss = 0.0 * denoised_seqs.sum()
+            seq_acc = denoised_seqs.new_zeros(())
+        return seq_loss, {"seq_acc": seq_acc}
+
 
 class ProtenixLoss(nn.Module):
     """Aggregation of the various losses"""
@@ -1453,6 +1516,8 @@ class ProtenixLoss(nn.Module):
         self.alpha_distogram = self.configs.loss.weight.alpha_distogram
         self.alpha_bond = self.configs.loss.weight.alpha_bond
         self.weight_smooth_lddt = self.configs.loss.weight.smooth_lddt
+        self.alpha_sequence = self.configs.loss.weight.alpha_sequence
+        self.sequence_train = self.configs.model.diffusion_module.sequence_train
 
         self.lddt_radius = {
             "is_nucleotide_threshold": 30.0,
@@ -1472,6 +1537,8 @@ class ProtenixLoss(nn.Module):
             * self.weight_smooth_lddt,  # Different from AF3 appendix eq(6), where smooth_lddt has no weight
             # distogram
             "distogram_loss": self.alpha_distogram,
+            # antibody codesign sequence CE
+            "sequence_loss": self.alpha_sequence,
         }
 
         # Loss
@@ -1483,6 +1550,7 @@ class ProtenixLoss(nn.Module):
         self.bond_loss = BondLoss(**configs.loss.diffusion.bond)
         self.smooth_lddt_loss = SmoothLDDTLoss(**configs.loss.diffusion.smooth_lddt)
         self.distogram_loss = DistogramLoss(**configs.loss.distogram)
+        self.sequence_loss = SequenceLoss()
 
     def calculate_label(
         self,
@@ -1726,6 +1794,27 @@ class ProtenixLoss(nn.Module):
                             true_coordinate=label_dict["coordinate"],
                             coordinate_mask=label_dict["coordinate_mask"],
                             rep_atom_mask=feat_dict["distogram_rep_atom_mask"],
+                        )
+                    }
+                )
+
+            # Sequence Loss (antibody codesign): CE between the sequence model's
+            # per-token logits and the ground-truth ids on designed (CDR) residues.
+            if pred_dict.get("sequence", None) is not None:
+                # discrete_absorb masks with the sampled seq_mask; discrete_uniform
+                # (and default) uses the static CDR design mask.
+                noise_type = self.configs.model.diffusion_module.sequence_noise_type
+                seq_mask = (
+                    feat_dict["seq_mask"]
+                    if noise_type == "discrete_absorb"
+                    else feat_dict["cdr_mask"]
+                )
+                loss_fns.update(
+                    {
+                        "sequence_loss": lambda: self.sequence_loss(
+                            denoised_seqs=pred_dict["sequence"],
+                            seqs_ground_truth=feat_dict["seq"],
+                            seq_masks=seq_mask,
                         )
                     }
                 )

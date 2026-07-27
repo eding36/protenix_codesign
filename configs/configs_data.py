@@ -62,9 +62,10 @@ default_weighted_pdb_configs = {
         # Antibody-only crop (used automatically for samples carrying H/L chain roles).
         # Keeps the whole Fv and, when add_antigen is set, grows a spatial antigen
         # neighborhood around a CDR anchor (MFDesign AntibodyCropper analog).
-        "antibody_add_antigen": True,
-        "antibody_min_neighborhood": 0,
-        "antibody_max_neighborhood": 40,
+        "antibody_add_antigen": GlobalConfigValue("antibody_add_antigen"),
+        "antibody_min_neighborhood": GlobalConfigValue("antibody_min_neighborhood"),
+        "antibody_max_neighborhood": GlobalConfigValue("antibody_max_neighborhood"),
+        "antibody_mixed_prob": GlobalConfigValue("antibody_mixed_prob"),
     },
     "sample_weight": 0.5,
     "limits": -1,
@@ -238,6 +239,45 @@ data_configs = {
             ),
             "indices_fpath": os.path.join(
                 PROTENIX_ROOT_DIR, "indices/posebusters_indices_mainchain_interface.csv"
+            ),
+            "pdb_list": "",
+            "find_pocket": True,
+            "find_all_pockets": False,
+            "max_n_token": GlobalConfigValue("test_max_n_token"),  # filter data
+        },
+        **deepcopy(default_test_configs),
+    },
+
+    "antibody_codesign_train_set": {
+        "base_info": {
+            "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+            "bioassembly_dict_dir": os.path.join(
+                PROTENIX_ROOT_DIR, "mmcif_bioassembly"
+            ),
+            "indices_fpath": os.path.join(
+                PROTENIX_ROOT_DIR,
+                "indices/train_indices.csv",
+            ),
+            "pdb_list": "",
+            "random_sample_if_failed": True,
+            "max_n_token": -1,  # can be used for removing data with too many tokens.
+            "use_reference_chains_only": False,
+            "exclusion": {  # do not sample the data based on ions.
+                "mol_1_type": ListValue(["ions"]),
+                "mol_2_type": ListValue(["ions"]),
+            },
+        },
+        **deepcopy(default_weighted_pdb_configs),
+    },
+
+    "antibody_codesign_test_set": {
+        "base_info": {
+            "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "test_mmcif"),
+            "bioassembly_dict_dir": os.path.join(
+                PROTENIX_ROOT_DIR, "test_bioassembly"
+            ),
+            "indices_fpath": os.path.join(
+                PROTENIX_ROOT_DIR, "indices/test_indices.csv"
             ),
             "pdb_list": "",
             "find_pocket": True,

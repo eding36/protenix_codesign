@@ -612,6 +612,7 @@ class BaseSingleDataset(Dataset):
         antibody_add_antigen: bool = True,
         antibody_min_neighborhood: int = 0,
         antibody_max_neighborhood: int = 40,
+        antibody_mixed_prob: float = 0.0,
     ) -> tuple[str, TokenArray, AtomArray, dict[str, Any], dict[str, Any]]:
         """
         Crops the bioassembly data based on the specified configurations.
@@ -634,6 +635,7 @@ class BaseSingleDataset(Dataset):
             antibody_add_antigen=antibody_add_antigen,
             antibody_min_neighborhood=antibody_min_neighborhood,
             antibody_max_neighborhood=antibody_max_neighborhood,
+            antibody_mixed_prob=antibody_mixed_prob,
         )
 
     def _get_sample_indice(self, idx: int) -> pd.Series:
