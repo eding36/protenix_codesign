@@ -23,6 +23,7 @@ from protenix.model.modules.primitives import LinearNoBias, Transition
 from protenix.model.modules.transformer import (
     AtomAttentionDecoder,
     AtomAttentionEncoder,
+    AttentionPairBias,
     DiffusionTransformer,
 )
 from protenix.model.triangular.layers import LayerNorm
@@ -230,10 +231,13 @@ class DiffusionSchedule:
 
 class SequenceD3PM(nn.Module):
     def __init__(
-        self, 
-        hidden_dim, 
+        self,
+        hidden_dim,
         vocab_size,
-        dropout
+        dropout,
+        c_z: int = 256,
+        n_pair_blocks: int = 2,
+        n_pair_heads: int = 8,
     ):
         super().__init__()
         self.type_embed = nn.Embedding(4, hidden_dim, padding_idx=0) # 1: Heavy, 2: Light, 3: Ag
@@ -251,6 +255,16 @@ class SequenceD3PM(nn.Module):
             nn.GELU(),
             nn.Linear(2 * hidden_dim, hidden_dim),
         )
+       #adding structural information using an attentionencoder module so that sequence prediction can be conditioned on structural/epitope information
+        self.pair_attn = nn.ModuleList([
+            AttentionPairBias(
+                has_s=False, n_heads=n_pair_heads, c_a=hidden_dim, c_z=c_z
+            )
+            for _ in range(n_pair_blocks)
+        ])
+        self.pair_transition = nn.ModuleList([
+            Transition(c_in=hidden_dim, n=2) for _ in range(n_pair_blocks)
+        ])
         self.decoder = nn.Sequential(
             nn.Linear(hidden_dim, 2 * hidden_dim),
             nn.GELU(),
@@ -258,15 +272,20 @@ class SequenceD3PM(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, vocab_size)
         )
-                
-          
-    def forward(self, res_feat, cond = None):
+
+
+    def forward(self, res_feat, cond=None, z=None):
         """Denoise the sequence feature.
 
         Args:
-            res_feat: The sequence feature. 
+            res_feat: The sequence feature.
 
             cond: The condition feature.
+
+            z: The pair representation (z_pair), ``[..., 1, N_token, N_token, c_z]``,
+                used as bias for the pair-biased token attention so design tokens can
+                reason about interface/epitope neighbours. When ``None`` the module
+                falls back to the pure per-token path (no neighbour attention).
 
         Returns:
             res (batch_size, max_tokens, vocab_size): The denoised sequence one-hot code.
@@ -276,6 +295,11 @@ class SequenceD3PM(nn.Module):
         region_embed = self.region_embed(cond["region"])
         res = torch.cat([res, type_embed, region_embed], dim=-1)
         res = self.dropout(self.LayerNorm(self.proj(res)))
+        # Reason about interface/epitope neighbours directly via z_pair.
+        if z is not None:
+            for attn, transition in zip(self.pair_attn, self.pair_transition):
+                res = res + attn(res, None, z)  # pair-biased self-attention
+                res = res + transition(res)     # feed-forward
         res = self.decoder(res)
         return res
     
@@ -361,6 +385,7 @@ class DiffusionModule(nn.Module):
             if sequence_model_args is None:
                 raise ValueError("sequence model args must be provided when training sequence model")
             self.sequence_model = SequenceD3PM(
+                c_z=c_z,
                 **sequence_model_args
             )
         # Alg20: line4
@@ -558,7 +583,13 @@ class DiffusionModule(nn.Module):
             cond["region"] = expand_at_dim(
                 input_feature_dict["region_type"], dim=-2, n=N_sample
             )  # [..., N_sample, N_token]
-            k_denoised = self.sequence_model(a_token, cond)
+            # Pass the (standard-layout, unpermuted) pair rep so the sequence head can
+            # attend over interface/epitope neighbours. z_pair is [..., 1, N_token,
+            # N_token, c_z]; its singleton sample dim broadcasts over a_token's
+            # N_sample exactly as it does for the diffusion transformer above.
+            k_denoised = self.sequence_model(
+                a_token, cond, z=z_pair.to(dtype=torch.float32)
+            )
         else:
             k_denoised = None
 
