@@ -99,7 +99,9 @@ model_configs = {
                 "sequence_model_args": {
                     "hidden_dim": 768,
                     "vocab_size": 20,
-                    "dropout": 0.1
+                    "dropout": 0.1,
+                    "n_pair_blocks": 2, #attention block config
+                    "n_pair_heads": 8 #attention block config
                 }
             }
         },
