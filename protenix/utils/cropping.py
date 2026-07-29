@@ -464,11 +464,16 @@ def get_antibody_crop_index(
     cropped: set[int] = set()
     total_atoms = 0
     # Add the antibody variable domain (Fv). When a per-token Fv mask is available
-    # (region_type 1-7), keep only the Fv; otherwise fall back to the whole resolved chain.
+    # (region_type 1-7), keep only the Fv domain. CDR masks come from MFDesign's
+    # curated summary, so nearly every H/L chain is Fv-labelled; the whole-chain
+    # branch is a thin guard for the residual chain that couldn't be aligned to the
+    # summary or numbered by abnumber -- keep it whole so the crop is never empty.
     for c in ref_chain_indices:
-        sel = (chain_id == c) & is_resolved
+        chain_resolved = (chain_id == c) & is_resolved
+        sel = chain_resolved
         if is_fv is not None:
-            sel = sel & is_fv
+            fv_sel = chain_resolved & is_fv  # variable-region tokens in the resolved chain
+            sel = fv_sel if fv_sel.any() else chain_resolved  # residual guard: keep whole chain if unlabelled
         cropped.update(all_idx[sel].tolist())
         total_atoms += int(atom_num[sel].sum())
 

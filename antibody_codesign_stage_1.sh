@@ -25,17 +25,16 @@ export LAYERNORM_TYPE=torch
 export PROTENIX_ROOT_DIR="/home/dinge/data/proj/protenix_codesign/data"
 # wget -P $PROTENIX_ROOT_DIR/checkpoint/ https://protenix.tos-cn-beijing.volces.com/checkpoint/protenix_base_default_v1.0.0.pt
 checkpoint_path="${PROTENIX_ROOT_DIR}/checkpoint/protenix_base_default_v1.0.0.pt"
-
-torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
+torchrun --standalone --nproc_per_node=1 /home/dinge/Protenix/runner/train.py \
 --model_name "protenix_base_default_v1.0.0_codesign" \
 --run_name protenix_antibody_codesign_stage_1 \
 --seed 42 \
 --base_dir ./output \
 --dtype fp32 \
 --project protenix \
---use_wandb false \
+--use_wandb true \
 --diffusion_batch_size 48 \
---eval_interval 400 \
+--eval_interval 5000 \
 --log_interval 50 \
 --checkpoint_interval 400 \
 --ema_decay 0.999 \
@@ -44,14 +43,14 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --warmup_steps 2000 \
 --lr 0.001 \
 --model.N_cycle 4 \
---sample_diffusion.N_step 20 \
+--sample_diffusion.N_step 200 \
 --triangle_attention "torch" \
 --triangle_multiplicative "torch" \
 --load_checkpoint_path ${checkpoint_path} \
 --load_ema_checkpoint_path ${checkpoint_path} \
 --data.train_sets antibody_codesign_train_set \
 --data.test_sets antibody_codesign_test_set \
---data.template.enable_prot_template true \
+--data.template.enable_prot_template false \
 --data.msa.enable_prot_msa true \
 --data.msa.enable_rna_msa false \
 --loss.weight.alpha_sequence 2.0 \

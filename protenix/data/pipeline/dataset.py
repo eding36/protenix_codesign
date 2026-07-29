@@ -27,7 +27,7 @@ from biotite.structure.atoms import AtomArray
 from ml_collections.config_dict import ConfigDict
 from torch.utils.data import Dataset
 
-from protenix.data.constants import EvaluationChainInterface
+from protenix.data.constants import EvaluationChainInterface, STD_RESIDUES_WITH_GAP
 from protenix.data.constraint.constraint_featurizer import ConstraintFeatureGenerator
 from protenix.data.core.featurizer import Featurizer
 from protenix.data.msa.msa_featurizer import MSAFeaturizer
@@ -899,6 +899,61 @@ class BaseSingleDataset(Dataset):
         features_dict["is_distillation"] = torch.tensor([self.is_distillation])
         if self.is_distillation is True:
             features_dict["resolution"] = torch.tensor([-1.0])
+       
+        #   (1) mask the query row (row 0) at CDR with UNK;
+        #   (2) for each homolog row, if its identity to the GT query on ANY contiguous
+        #       CDR segment (CDR1/2/3 per chain) >= 0.2, blank that homolog's CDR
+        #       columns (MFDesign drops the whole row; masking the CDR columns is
+        #       leak-equivalent and keeps its framework co-evolution signal).
+        # profile + deletion_mean are then recomputed. 
+        MSA_CDR_SIM_THRESHOLD = 0.2  # MFDesign msa_filtering_threshold default
+        cdr = features_dict.get("cdr_mask")
+        if cdr is not None and "msa" in features_dict and cdr.bool().any():
+            cdrb = cdr.bool()  # [N_token]
+            unk = STD_RESIDUES_WITH_GAP["UNK"]
+            seq_gt = features_dict["seq"].long().reshape(-1)  # clean GT ids [N_token]
+            msa = features_dict["msa"]  # [N_msa, N_token] token ids
+            del_keys = [k for k in ("has_deletion", "deletion_value") if k in features_dict]
+
+            # (1) mask the MSA query row CDR residues (+ its deletion stats, like MFDesign's X seq)
+            msa[0, cdrb] = unk
+            for k in del_keys:
+                features_dict[k][0, cdrb] = 0
+
+            # (2) blank CDR-similar homolog rows' CDR columns (per-CDR-segment threshold)
+            if msa.shape[0] > 1:
+                cdr_idx = cdrb.nonzero().flatten().tolist() #find CDR loop indexes
+                segments, s, p = [], cdr_idx[0], cdr_idx[0] #segments: [(start_cdr_idx,end_cdr_idx)]
+                for j in cdr_idx[1:]:
+                    if j != p + 1:
+                        segments.append((s, p))
+                        s = j
+                    p = j
+                segments.append((s, p))
+                for r in range(1, msa.shape[0]): #iterate through each homolog except for row 0
+                    for a, b in segments: 
+                        sl = slice(a, b + 1)
+                        if (msa[r, sl] == seq_gt[sl]).float().mean() >= MSA_CDR_SIM_THRESHOLD: #fraction of the CDR loop that matches query sequence
+                            msa[r, cdrb] = unk #mask all of this row's cdr columns
+                            for k in del_keys:
+                                features_dict[k][r, cdrb] = 0
+                            break
+
+            # (3) recompute profile + deletion_mean at CDR from the scrubbed MSA
+            #deletion_mean is a feature describing how many insertions/deletions on avg per homolog. 
+            #deletion_mean must be adjusted to ignore the masked CDR columns
+            if "profile" in features_dict:
+                prof = features_dict["profile"]  # [N_token, vocab]
+                vocab = prof.shape[-1]
+                onehot = torch.nn.functional.one_hot(
+                    msa.long().clamp_(min=0, max=vocab - 1), num_classes=vocab
+                ).to(prof.dtype)
+                prof[cdrb] = onehot[:, cdrb].mean(dim=0)
+            if "deletion_mean" in features_dict and "deletion_value" in features_dict:
+                features_dict["deletion_mean"][cdrb] = (
+                    features_dict["deletion_value"][:, cdrb].float().mean(dim=0)
+                )
+
         return features_dict, labels_dict, label_full_dict
 
 

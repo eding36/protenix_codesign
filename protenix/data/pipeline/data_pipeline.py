@@ -60,6 +60,8 @@ class DataPipeline(object):
         dataset: str = "WeightedPDB",
         strip_antibody_cdr: bool = False,
         sabdab_roles: Union[dict, None] = None,
+        skip_assembly_expansion: bool = False,
+        assembly_id: str = "1",
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """
         Get raw data from mmcif with tokenizer and a list of chains and interfaces for sampling.
@@ -83,13 +85,19 @@ class DataPipeline(object):
         try:
             if dataset == "WeightedPDB":
                 parser = MMCIFParser(mmcif_file=mmcif)
-                bioassembly_dict = parser.get_bioassembly()
+                bioassembly_dict = parser.get_bioassembly(
+                    assembly_id=assembly_id,
+                    skip_assembly_expansion=skip_assembly_expansion,
+                )
             elif dataset == "Distillation":
                 parser = DistillationMMCIFParser(mmcif_file=mmcif)
                 bioassembly_dict = parser.get_structure_dict()
             elif dataset == "RecentPDB":
                 parser = RecentPDB_MMCIFParser(mmcif_file=mmcif)
-                bioassembly_dict = parser.get_bioassembly()
+                bioassembly_dict = parser.get_bioassembly(
+                    assembly_id=assembly_id,
+                    skip_assembly_expansion=skip_assembly_expansion,
+                )
             else:
                 raise NotImplementedError(
                     'Unsupported "dataset", please input either "WeightedPDB" or "Distillation".'
@@ -108,12 +116,27 @@ class DataPipeline(object):
                 "resolution", [parser.resolution] * len(atom_array)
             )
 
+            # Collect this PDB's curated Fv (reference, CDR-masked) sequence pairs
+            # from the SAbDab summary so CDR boundaries come from MFDesign's masks
+            # (no abnumber numbering, which fails on ~10% of chains). Extracted
+            # before stripping since strip runs ahead of role resolution below.
+            summary_seqs: list[tuple[str, str]] = []
+            if sabdab_roles:
+                _entries = sabdab_roles.get(str(bioassembly_dict["pdb_id"]).lower())
+                for _e in _entries or []:
+                    if _e.get("H_seq") and _e.get("H_masked"):
+                        summary_seqs.append((_e["H_seq"], _e["H_masked"]))
+                    if _e.get("L_seq") and _e.get("L_masked"):
+                        summary_seqs.append((_e["L_seq"], _e["L_masked"]))
+
             if strip_antibody_cdr:
                 # Strip antibody CDR side chains (keep backbone + CB) before
                 # tokenization. Only ref_pos/ref_charge/ref_mask/res_perm depend on
                 # the per-residue atom set, so recompute just those; all other
                 # per-atom annotations survive boolean indexing (CA/CB are kept).
-                atom_array, n_removed = strip_cdr_side_chains(atom_array)
+                atom_array, n_removed = strip_cdr_side_chains(
+                    atom_array, summary_seqs=summary_seqs or None
+                )
                 if n_removed > 0:
                     atom_array = AddAtomArrayAnnot.add_ref_info_and_res_perm(atom_array)
                 bioassembly_dict["atom_array"] = atom_array

@@ -1474,10 +1474,29 @@ class SequenceLoss(nn.Module):
         Returns:
             tuple[torch.Tensor, dict[str, torch.Tensor]]: (loss, {"seq_acc": acc}).
         """
-        # Broadcast GT/mask across any leading sample dims of the prediction so the
-        # boolean masks line up with denoised_seqs[..., :-1].
         gt = seqs_ground_truth
         mask = seq_masks
+
+        # Eval/inference path: ``denoised_seqs`` is the already-decoded designed
+        # sequence (integer token ids ``[..., N_token]``) from the sampling rollout,
+        # not per-token logits. Report sequence-recovery accuracy (AAR) on designed residues insteaad
+        if not denoised_seqs.is_floating_point():
+            pred_ids = denoised_seqs
+            while gt.dim() < pred_ids.dim():
+                gt = gt.unsqueeze(0)
+                mask = mask.unsqueeze(0)
+            gt = gt.expand_as(pred_ids)
+            mask = mask.expand_as(pred_ids)
+            valid_mask = (gt >= self._AA_MIN) & (gt <= self._AA_MAX) & mask.bool()
+            if valid_mask.any():
+                seq_acc = (pred_ids[valid_mask] == gt[valid_mask]).float().mean()
+            else:
+                seq_acc = pred_ids.new_zeros(()).float()
+            return pred_ids.new_zeros(()).float(), {"seq_acc": seq_acc}
+
+        # Training path: ``denoised_seqs`` are per-token logits
+        # ``[..., N_token, vocab_size]``. Broadcast GT/mask across any leading
+        # sample dims so the boolean masks line up with ``denoised_seqs[..., :-1]``.
         while gt.dim() < denoised_seqs.dim() - 1:
             gt = gt.unsqueeze(-2)
             mask = mask.unsqueeze(-2)

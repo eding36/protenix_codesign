@@ -12,27 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+export CUDA_VISIBLE_DEVICES=1
 # fast_layernorm is used by default, no need to set explicitly. Set LAYERNORM_TYPE=torch to disable.
-# export LAYERNORM_TYPE=fast_layernorm
+# NOTE: the fused fast_layernorm CUDA kernel is NOT built for Blackwell (sm_120) and
+# silently returns its input UNNORMALIZED there, so the pair rep explodes to NaN.
+# Force the native torch LayerNorm on this GPU.
+export LAYERNORM_TYPE=torch
 # Kernel options:
 # - triangle_attention: supports 'triattention', 'cuequivariance', 'deepspeed', 'torch'
 # - triangle_multiplicative: supports 'cuequivariance', 'torch'
-export LAYERNORM_TYPE=torch
-# Specify your data root directory by uncommenting the following line.
-# export PROTENIX_ROOT_DIR="/modify/to/your/data_root_dir"
-# wget -P $PROTENIX_ROOT_DIR/checkpoint/ https://protenix.tos-cn-beijing.volces.com/checkpoint/protenix_base_default_v1.0.0.pt
-checkpoint_path="${PROTENIX_ROOT_DIR}/output/protenix_antibody_codesign_stage_1_<timestamp>/checkpoints/{step}.pt"
 
-python3 /home/dinge/Protenix/runner/train.py \
+# Specify your data root directory by uncommenting the following line.
+export PROTENIX_ROOT_DIR="/home/dinge/data/proj/protenix_codesign/data"
+# wget -P $PROTENIX_ROOT_DIR/checkpoint/ https://protenix.tos-cn-beijing.volces.com/checkpoint/protenix_base_default_v1.0.0.pt
+checkpoint_path="/home/dinge/Protenix/output/protenix_antibody_codesign_stage_1_20260727_102716/checkpoints/stage_1.pt"
+torchrun --standalone --nproc_per_node=1 /home/dinge/Protenix/runner/train.py \
 --model_name "protenix_base_default_v1.0.0_codesign" \
 --run_name protenix_antibody_codesign_stage_2 \
 --seed 42 \
 --base_dir ./output \
---dtype bf16 \
+--dtype fp32 \
 --project protenix \
---use_wandb false \
---diffusion_batch_size 48 \
---eval_interval 400 \
+--use_wandb true \
+--diffusion_batch_size 32 \
+--eval_interval 5000 \
 --log_interval 50 \
 --checkpoint_interval 400 \
 --ema_decay 0.999 \
@@ -41,14 +44,15 @@ python3 /home/dinge/Protenix/runner/train.py \
 --warmup_steps 2000 \
 --lr 0.001 \
 --model.N_cycle 4 \
---sample_diffusion.N_step 20 \
---triangle_attention "cuequivariance" \
---triangle_multiplicative "cuequivariance" \
+--sample_diffusion.N_step 200 \
+--triangle_attention "torch" \
+--triangle_multiplicative "torch" \
 --load_checkpoint_path ${checkpoint_path} \
 --load_ema_checkpoint_path ${checkpoint_path} \
 --data.train_sets antibody_codesign_train_set \
 --data.test_sets antibody_codesign_test_set \
---data.template.enable_prot_template true \
+--data.template.enable_prot_template false \
+--data.msa.enable_prot_msa true \
 --data.msa.enable_rna_msa false \
 --loss.weight.alpha_sequence 2.0 \
 --antibody_add_antigen true \

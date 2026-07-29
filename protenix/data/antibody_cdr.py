@@ -20,9 +20,13 @@ CDR residues, only backbone + CB atoms are kept, so that the per-residue atom
 count / reference conformer cannot leak the identity of a residue the model is
 being asked to design.
 
-CDR boundaries follow the Chothia scheme, computed with ``abnumber`` (backed by
-ANARCI/anarcii), exactly as MFDesign does. Chains that do not parse as an
-antibody heavy/light variable domain are left untouched.
+CDR boundaries follow the Chothia scheme. They are read from MFDesign's curated
+per-chain CDR masks (``*_chain_masked_seq``: ``X`` at CDR positions) when a chain
+aligns to a summary entry -- the same masks MFDesign trains on, and available for
+every summary complex. Chains not covered by the summary fall back to numbering
+with ``abnumber`` (backed by ANARCI/anarcii); abnumber fails to number ~10% of
+chains, which is why the curated masks are preferred. Chains that neither align
+to the summary nor parse as an antibody variable domain are left untouched.
 """
 
 import logging
@@ -130,12 +134,107 @@ def _chain_residue_region_labels(struct_seq: str, seq_cache: dict) -> "list[int]
     return result
 
 
-def strip_cdr_side_chains(atom_array: AtomArray) -> "tuple[AtomArray, int]":
+def _cdr_runs(masked_seq: str) -> "list[tuple[int, int]]":
+    """Return the (start, stop) spans of maximal ``X`` runs in a masked sequence."""
+    runs = []
+    i, n = 0, len(masked_seq)
+    while i < n:
+        if masked_seq[i] == "X":
+            j = i
+            while j < n and masked_seq[j] == "X":
+                j += 1
+            runs.append((i, j))
+            i = j
+        else:
+            i += 1
+    return runs
+
+
+def _ref_region_labels(masked_seq: str) -> "list[int] | None":
+    """Per-position Chothia region labels (1-7) for a summary masked Fv sequence.
+
+    MFDesign's ``*_masked_seq`` marks the three CDRs with ``X`` runs. The runs are
+    cdr1/cdr2/cdr3 (labels 2/4/6); the framework segments around them are
+    fr1..fr4 (labels 1/3/5/7) -- the same ``_REGION_LABELS`` scheme abnumber
+    produces. Returns ``None`` unless there are exactly three CDR runs (so it can
+    be mapped onto the seven-region Chothia layout).
+    """
+    runs = _cdr_runs(masked_seq)
+    if len(runs) != 3:
+        return None
+    n = len(masked_seq)
+    (c1s, c1e), (c2s, c2e), (c3s, c3e) = runs
+    segments = [
+        (0, c1s, _REGION_LABELS["fr1"]),
+        (c1s, c1e, _REGION_LABELS["cdr1"]),
+        (c1e, c2s, _REGION_LABELS["fr2"]),
+        (c2s, c2e, _REGION_LABELS["cdr2"]),
+        (c2e, c3s, _REGION_LABELS["fr3"]),
+        (c3s, c3e, _REGION_LABELS["cdr3"]),
+        (c3e, n, _REGION_LABELS["fr4"]),
+    ]
+    labels = [0] * n
+    for start, stop, label in segments:
+        for k in range(start, stop):
+            labels[k] = label
+    return labels
+
+
+def _region_labels_from_summary(
+    struct_seq: str, summary_seqs: "list[tuple[str, str]]"
+) -> "list[int] | None":
+    """Map a chain's structure sequence to region labels from SAbDab summary seqs.
+
+    ``summary_seqs`` is a list of ``(ref_seq, masked_seq)`` pairs (H and/or L)
+    from MFDesign's curated summary, where ``ref_seq`` is the Fv reference
+    sequence and ``masked_seq`` is the same sequence with CDRs replaced by ``X``.
+    For each pair whose reference aligns to ``struct_seq`` we transfer the
+    masked-derived region labels (1-7) onto the matched structure positions,
+    returning a per-residue label list (0 outside the Fv). Returns ``None`` if no
+    pair aligns, in which case the caller falls back to abnumber numbering.
+
+    This bypasses abnumber/ANARCI, which fails to number ~10% of chains; the
+    summary CDR masks are pre-computed once by MFDesign and always available.
+    """
+    import difflib
+
+    for ref_seq, masked_seq in summary_seqs:
+        if not ref_seq or not masked_seq or len(ref_seq) != len(masked_seq):
+            continue
+        ref_labels = _ref_region_labels(masked_seq)
+        if ref_labels is None:
+            continue
+        labels = [0] * len(struct_seq)
+        # Fast path: the Fv reference is an exact substring of the structure seq.
+        offset = struct_seq.find(ref_seq)
+        if offset >= 0:
+            for i, label in enumerate(ref_labels):
+                labels[offset + i] = label
+            return labels
+        # Robust path: unresolved residues / point mutations break an exact find,
+        # so align ref->struct and transfer labels only on matched blocks. Require
+        # most of the Fv to match to avoid mislabelling an unrelated chain.
+        matcher = difflib.SequenceMatcher(None, ref_seq, struct_seq, autojunk=False)
+        blocks = matcher.get_matching_blocks()
+        matched = sum(size for _, _, size in blocks)
+        if matched >= int(0.9 * len(ref_seq)):
+            for i, j, size in blocks:
+                for k in range(size):
+                    labels[j + k] = ref_labels[i + k]
+            return labels
+    return None
+
+
+def strip_cdr_side_chains(
+    atom_array: AtomArray, summary_seqs: "list[tuple[str, str]] | None" = None
+) -> "tuple[AtomArray, int]":
     """Remove side-chain atoms of antibody CDR residues from an AtomArray.
 
     For every protein chain that parses as an antibody heavy/light variable
-    domain (Chothia numbering via abnumber), residues in CDR1/2/3 are reduced to
-    backbone + CB atoms. All other atoms/chains are left untouched. A boolean
+    domain, residues in CDR1/2/3 are reduced to backbone + CB atoms. CDR
+    boundaries come from MFDesign's curated ``summary_seqs`` when a chain aligns
+    to one (``_region_labels_from_summary``), falling back to Chothia numbering
+    via abnumber otherwise. All other atoms/chains are left untouched. A boolean
     per-atom ``is_cdr`` annotation marking atoms that belong to a CDR residue is
     added (set before stripping, so the retained backbone/CB atoms of CDR residues
     are flagged True). An integer per-atom ``region_label`` annotation is added
@@ -186,7 +285,13 @@ def strip_cdr_side_chains(atom_array: AtomArray) -> "tuple[AtomArray, int]":
         if len(struct_seq) < 70:
             continue
 
-        region_labels = _chain_residue_region_labels(struct_seq, seq_cache)
+        # Prefer MFDesign's curated CDR masks (always available, no numbering);
+        # fall back to abnumber only for chains not covered by the summary.
+        region_labels = None
+        if summary_seqs:
+            region_labels = _region_labels_from_summary(struct_seq, summary_seqs)
+        if region_labels is None:
+            region_labels = _chain_residue_region_labels(struct_seq, seq_cache)
         if region_labels is None:
             continue
 
@@ -412,6 +517,13 @@ def load_sabdab_chain_roles(csv_path) -> "dict[str, list[dict]]":
                     "H": _clean(row.get("H_chain_id")),
                     "L": _clean(row.get("L_chain_id")),
                     "antigen": _parse_antigen(row.get("antigen_chain_id")),
+                    # Curated Fv reference + CDR-masked seqs (if present) so CDR
+                    # boundaries come from the mask, not abnumber. See
+                    # :func:`_region_labels_from_summary`.
+                    "H_seq": _clean(row.get("H_chain_seq")),
+                    "H_masked": _clean(row.get("H_chain_masked_seq")),
+                    "L_seq": _clean(row.get("L_chain_seq")),
+                    "L_masked": _clean(row.get("L_chain_masked_seq")),
                 }
             )
     return roles

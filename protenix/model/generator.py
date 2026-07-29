@@ -253,8 +253,13 @@ class InferenceNoiseScheduler:
 
 def _splice_restype_slice(s_inputs, masked_seq, offset, width):
     """Replace the ``[offset : offset+width]`` restype slice of ``s_inputs`` with
-    the one-hot of ``masked_seq`` (MFDesign "s_replaced")."""
+    the one-hot of ``masked_seq`` (MFDesign "s_replaced").
+    """
     new_restype = one_hot(masked_seq, num_classes=width).to(s_inputs.dtype)
+    if new_restype.dim() < s_inputs.dim():
+        new_restype = new_restype.reshape(
+            (1,) * (s_inputs.dim() - new_restype.dim()) + tuple(new_restype.shape)
+        ).expand(*s_inputs.shape[:-1], width)
     return torch.cat(
         [s_inputs[..., :offset], new_restype, s_inputs[..., offset + width :]], dim=-1
     )

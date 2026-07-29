@@ -694,6 +694,7 @@ class MMCIFParser:
         assembly_id: str = "1",
         max_assembly_chains: int = 1000,
         max_chains: Optional[int] = 20,
+        skip_assembly_expansion: bool = False,
     ) -> dict[str, Any]:
         """
         Build the given biological assembly.
@@ -838,13 +839,19 @@ class MMCIFParser:
             logger.atom_array = atom_array
 
         # expand created AtomArray by expand bioassembly
-        with stat_logger.log(
-            "expand_assembly",
-            atom_array,
-            ["atom", "bond", "residue", "chain", "entity"],
-        ) as logger:
-            atom_array = self.expand_assembly(atom_array, assembly_id)
-            logger.atom_array = atom_array
+        # skip_assembly_expansion keeps the full asymmetric unit (all chains) instead
+        # of biological assembly `assembly_id`. Used by the antibody per-complex path
+        # so complexes whose chains live outside assembly 1 (e.g. a second
+        # crystallographic antibody copy) still have their chains available for role
+        # resolution.
+        if not skip_assembly_expansion:
+            with stat_logger.log(
+                "expand_assembly",
+                atom_array,
+                ["atom", "bond", "residue", "chain", "entity"],
+            ) as logger:
+                atom_array = self.expand_assembly(atom_array, assembly_id)
+                logger.atom_array = atom_array
 
         if len(atom_array) == 0:
             # If no chains corresponding to the assembly_id remain in the AtomArray

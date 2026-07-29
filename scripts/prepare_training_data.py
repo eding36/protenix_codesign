@@ -282,6 +282,23 @@ def _write_single_complex_cif(
     return True
 
 
+def _assembly_ids(mmcif) -> list:
+    """Biological-assembly ids declared in the mmCIF (e.g. ``['1', '2']``), in file
+    order; empty when none are declared. Used to locate the assembly that actually
+    contains an antibody complex's chains when assembly 1 does not (e.g. a second
+    crystallographic antibody copy declared as assembly 2)."""
+    try:
+        from protenix.data.core.parser import MMCIFParser
+
+        block = MMCIFParser(mmcif_file=str(mmcif)).cif.block
+        if "pdbx_struct_assembly_gen" in block:
+            ids = block["pdbx_struct_assembly_gen"]["assembly_id"].as_array(str)
+            return list(dict.fromkeys(str(x) for x in ids))
+    except Exception:
+        pass
+    return []
+
+
 def gen_a_complex_data(
     complex_id: str,
     pdb_id: str,
@@ -319,6 +336,51 @@ def gen_a_complex_data(
         sabdab_roles=sabdab_roles,
     )
 
+    # Biological assembly 1 may exclude this complex's chains (e.g. a second
+    # crystallographic antibody copy: 1ap2 assembly 1 = A,B, but the complex is
+    # chains D,C, declared as assembly 2). When an antibody complex's H/L roles
+    # fail to resolve, search the other declared assemblies for the one that
+    # contains its chains (below); only if none do fall back to the full ASU.
+    def _entry_is_antibody(e: dict) -> bool:
+        return bool(e.get("H") or e.get("L"))
+
+    def _roles_unresolved(rows: Optional[list]) -> bool:
+        if not rows:
+            return True
+        r = rows[0]
+        return not (
+            str(r.get("H_chain_id", "")).strip() or str(r.get("L_chain_id", "")).strip()
+        )
+
+    if _entry_is_antibody(entry) and _roles_unresolved(sample_indices_list):
+        # Assembly 1 didn't contain this complex's chains. Try each *other* declared
+        # biological assembly and keep the first that resolves the H/L roles (e.g.
+        # 1ap2's D,C copy lives in assembly 2), so the bioassembly stays minimal.
+        # Only if no declared assembly contains them fall back to the full ASU.
+        for aid in _assembly_ids(mmcif):
+            if aid == "1":
+                continue
+            rows_a, bd_a = DataPipeline.get_data_from_mmcif(
+                mmcif,
+                cluster_file,
+                dataset,
+                strip_antibody_cdr=strip_antibody_cdr,
+                sabdab_roles=sabdab_roles,
+                assembly_id=aid,
+            )
+            if not _roles_unresolved(rows_a):
+                sample_indices_list, bioassembly_dict = rows_a, bd_a
+                break
+        else:
+            sample_indices_list, bioassembly_dict = DataPipeline.get_data_from_mmcif(
+                mmcif,
+                cluster_file,
+                dataset,
+                strip_antibody_cdr=strip_antibody_cdr,
+                sabdab_roles=sabdab_roles,
+                skip_assembly_expansion=True,
+            )
+
     if sample_indices_list and bioassembly_dict:
         source_pdb_id = bioassembly_dict.get("pdb_id")
         bioassembly_dict["pdb_id"] = complex_id
@@ -342,6 +404,50 @@ def gen_a_complex_data(
         return sample_indices_list
 
 
+def _dedup_one_row_per_complex(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Reduce the indices to a single representative sample row per complex.
+
+    In per-complex mode the ``pdb_id`` column holds the complex id, and each
+    complex expands into many sample rows (one per chain / per pairwise interface,
+    including ligand/ion interfaces). Evaluation iterates every row and averages
+    the metric, so leaving them in both inflates eval cost (one 200-step rollout
+    per row) and biases ``seq_acc`` toward many-chain complexes -- see the
+    train-vs-test sampling asymmetry. Training is unaffected (weighted sampling),
+    so this is applied to the test/eval indices only.
+
+    The antibody crop is driven by the H/L roles on the token array, not by which
+    interface row is sampled, so any row yields the same Fv crop; we deterministically
+    keep the protein-protein interface row with the most tokens (the antibody-antigen
+    interface, most codesign-relevant) as the representative.
+    """
+    if df.empty or "pdb_id" not in df.columns:
+        return df
+    n_rows, n_cplx = len(df), df["pdb_id"].nunique()
+    df = df.copy()
+    # Prefer a protein-protein *interface* row (mol type is encoded as "prot"):
+    # for an antibody complex this is the antibody-antigen/antibody interface,
+    # the most codesign-relevant anchor. Falls back to any row otherwise.
+    is_pp = (df.get("mol_1_type") == "prot") & (df.get("mol_2_type") == "prot")
+    df["_pp"] = is_pp.astype(int)
+    sort_cols = ["pdb_id", "_pp"]
+    ascending = [True, False]
+    if "num_tokens" in df.columns:
+        sort_cols.append("num_tokens")
+        ascending.append(False)
+    # Final deterministic tie-breaks so the kept row is reproducible.
+    for tb in ("chain_1_id", "chain_2_id"):
+        if tb in df.columns:
+            sort_cols.append(tb)
+            ascending.append(True)
+    df = df.sort_values(by=sort_cols, ascending=ascending, kind="mergesort")
+    df = df.drop_duplicates(subset=["pdb_id"], keep="first").drop(columns=["_pp"])
+    print(
+        f"[dedup] test indices: {n_rows} sample rows -> {len(df)} "
+        f"(one representative row per complex; {n_cplx} complexes)."
+    )
+    return df
+
+
 def gen_data_from_complexes(
     complexes: dict,
     mmcif_dir: Path,
@@ -352,6 +458,7 @@ def gen_data_from_complexes(
     num_workers: int = 1,
     strip_antibody_cdr: bool = True,
     cif_output_dir: Optional[Path] = None,
+    one_row_per_complex: bool = False,
 ):
     """Generate training data per antibody-antigen complex from a JSON dict containing all structures to be processed.
 
@@ -386,6 +493,14 @@ def gen_data_from_complexes(
                 for s in (val.get("antigen_chain_id") or [])
                 if str(s).strip()
             ],
+            # MFDesign's curated Fv reference + CDR-masked (X at CDRs) sequences.
+            # Carried through to strip_cdr_side_chains, which reads CDR boundaries
+            # from these masks instead of re-numbering with abnumber (which fails
+            # on ~10% of chains). Absent -> abnumber fallback.
+            "H_seq": val.get("H_chain_seq"),
+            "H_masked": val.get("H_chain_masked_seq"),
+            "L_seq": val.get("L_chain_seq"),
+            "L_masked": val.get("L_chain_masked_seq"),
         }
         work.append((complex_id, pdb_id, mmcif, entry))
 
@@ -425,6 +540,10 @@ def gen_data_from_complexes(
             merged_results += sample_indices_list
     df = pd.DataFrame(merged_results)
 
+    # Test/eval set: keep one representative row per complex (see docstring).
+    if one_row_per_complex:
+        df = _dedup_one_row_per_complex(df)
+
     df.to_csv(output_indices_csv, index=False, quoting=csv.QUOTE_NONNUMERIC)
 
 
@@ -440,6 +559,7 @@ def run_gen_data(
     mmcif_dir: Optional[Path] = None,
     complexes_json: Optional[Path] = None,
     cif_output_dir: Optional[Path] = None,
+    one_row_per_complex: bool = False,
 ):
     """
     Generates data from MMCIF files and saves the output to specified locations.
@@ -482,6 +602,16 @@ def run_gen_data(
         with open(input_path) as f:
             input_obj = json.load(f)
         complexes = _resolve_complexes(input_obj, complexes_json)
+        # Dedup to one row per complex for the test/eval split only. Auto-enabled
+        # when the split file looks like a test entry (e.g. test_entry.json), or
+        # forced via --one_row_per_complex. Train/val keep all rows (weighted
+        # sampling relies on them).
+        dedup = one_row_per_complex or ("test" in input_path.stem.lower())
+        if dedup:
+            print(
+                f"[dedup] '{input_path.name}' treated as a test/eval split: "
+                "writing one representative sample row per complex."
+            )
         gen_data_from_complexes(
             complexes,
             Path(mmcif_dir),
@@ -492,6 +622,7 @@ def run_gen_data(
             num_workers,
             strip_antibody_cdr,
             cif_output_dir,
+            one_row_per_complex=dedup,
         )
         return
 
@@ -622,6 +753,19 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--one_row_per_complex",
+        action="store_true",
+        help=(
+            "Write only one representative sample row per complex to the indices "
+            "CSV (the antibody-antigen interface row). Intended for the TEST/EVAL "
+            "split so each complex is evaluated once instead of once per "
+            "chain/interface. Auto-enabled when -i looks like a test entry file "
+            "(name contains 'test'). Do NOT use for train/val (weighted sampling "
+            "needs all rows)."
+        ),
+    )
+
+    parser.add_argument(
         "--cif_output_dir",
         type=Path,
         default=None,
@@ -648,4 +792,5 @@ if __name__ == "__main__":
         mmcif_dir=args.mmcif_dir,
         complexes_json=args.complexes_json,
         cif_output_dir=args.cif_output_dir,
+        one_row_per_complex=args.one_row_per_complex,
     )

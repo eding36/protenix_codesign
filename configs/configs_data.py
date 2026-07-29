@@ -280,7 +280,7 @@ data_configs = {
                 PROTENIX_ROOT_DIR, "indices/test_indices.csv"
             ),
             "pdb_list": "",
-            "find_pocket": True,
+            "find_pocket": False,
             "find_all_pockets": False,
             "max_n_token": GlobalConfigValue("test_max_n_token"),  # filter data
         },
