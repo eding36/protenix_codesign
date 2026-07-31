@@ -25,7 +25,7 @@ export LAYERNORM_TYPE=torch
 # Specify your data root directory by uncommenting the following line.
 export PROTENIX_ROOT_DIR="/home/dinge/data/proj/protenix_codesign/data"
 # wget -P $PROTENIX_ROOT_DIR/checkpoint/ https://protenix.tos-cn-beijing.volces.com/checkpoint/protenix_base_default_v1.0.0.pt
-checkpoint_path="/home/dinge/Protenix/output/protenix_antibody_codesign_stage_1_20260729_103800/checkpoints/stage_1.pt"
+checkpoint_path="/home/dinge/Protenix/output/protenix_antibody_codesign_stage_1_angular_diffusion_20260729_103800/checkpoints/stage_1.pt"
 torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --model_name "protenix_base_default_v1.0.0_codesign" \
 --run_name protenix_antibody_codesign_stage_2_angular_diffusion \
