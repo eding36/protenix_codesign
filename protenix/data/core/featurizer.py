@@ -344,6 +344,17 @@ class Featurizer(object):
         # the diffusion module. Non-antibody data has no is_cdr_residue annotation,
         # so nothing is masked and the extra features carry harmless defaults.
         token_features["seq"] = restype_onehot.argmax(dim=-1)  # [N_token] clean ids
+
+        # Antibody codesign specific features. Inject into token_features, from token array
+        for feat_name in ("chain_type", "region_type"):
+            if feat_name in token_annots:
+                token_features[feat_name] = torch.tensor(
+                    self.cropped_token_array.get_annotation(feat_name),
+                    dtype=torch.long,
+                )
+            else:
+                token_features[feat_name] = torch.zeros(n_token, dtype=torch.long)
+
         if "is_cdr_residue" in token_annots:
             cdr_mask = torch.tensor(
                 self.cropped_token_array.get_annotation("is_cdr_residue"),
@@ -351,6 +362,8 @@ class Featurizer(object):
             )
         else:
             cdr_mask = torch.zeros(n_token, dtype=torch.bool)
+        _chain_type = token_features["chain_type"]
+        cdr_mask = cdr_mask & ((_chain_type == 1) | (_chain_type == 2))
         token_features["cdr_mask"] = cdr_mask
         unk_index = STD_RESIDUES_WITH_GAP["UNK"]
         restype_onehot[cdr_mask] = 0.0 #set CDR residues to 0 ("masking")
@@ -370,19 +383,6 @@ class Featurizer(object):
             centre_atoms.sym_id_int.astype(np.int64)
         )
         token_features["restype"] = restype_onehot  # UNK-masked at CDR tokens
-
-        # Antibody codesign: per-token chain_type (0=pad,1=Heavy,2=Light,3=Ag) and
-        # region_type (0=pad, 1-7 Chothia Fv regions, 8=antigen) feed the sequence
-        # model's type/region embeddings (diffusion.py SequenceD3PM); non-antibody
-        # tokens default to 0 so the feature is always present.
-        for feat_name in ("chain_type", "region_type"):
-            if feat_name in token_annots:
-                token_features[feat_name] = torch.tensor(
-                    self.cropped_token_array.get_annotation(feat_name),
-                    dtype=torch.long,
-                )
-            else:
-                token_features[feat_name] = torch.zeros(n_token, dtype=torch.long)
 
         return token_features
 
