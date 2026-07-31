@@ -323,15 +323,38 @@ class AF3Trainer(object):
             )
             sample_key = list(checkpoint["model"].keys())[0]
             self.print(f"Sampled key: {sample_key}")
-            if sample_key.startswith("module.") and not self.use_ddp:
-                # DDP checkpoint has module. prefix, remove it if not using DDP
+            # Align the checkpoint's key namespace with the model's. DDP wraps the
+            # model before this runs, so self.model.state_dict() is "module."-prefixed
+            # while a checkpoint saved from a single-GPU run is not (and vice versa).
+            # With load_strict=False a mismatch here silently loads NOTHING.
+            ckpt_is_ddp = sample_key.startswith("module.")
+            if ckpt_is_ddp and not self.use_ddp:
                 checkpoint["model"] = {
                     k[len("module.") :]: v for k, v in checkpoint["model"].items()
                 }
+            elif self.use_ddp and not ckpt_is_ddp:
+                checkpoint["model"] = {
+                    f"module.{k}": v for k, v in checkpoint["model"].items()
+                }
 
-            self.model.load_state_dict(
+            incompatible = self.model.load_state_dict(
                 state_dict=checkpoint["model"],
                 strict=self.configs.load_strict,
+            )
+            n_missing = len(incompatible.missing_keys)
+            n_unexpected = len(incompatible.unexpected_keys)
+            if n_missing or n_unexpected:
+                # Expected for the codesign head on top of the base checkpoint; a
+                # count in the thousands means the namespaces did not line up.
+                self.print(
+                    f"load_state_dict: {n_missing} missing / {n_unexpected} unexpected keys, "
+                    f"e.g. missing={incompatible.missing_keys[:3]}, "
+                    f"unexpected={incompatible.unexpected_keys[:3]}"
+                )
+            n_loaded = len(self.model.state_dict()) - n_missing
+            assert n_loaded > 0, (
+                f"No parameters were loaded from {checkpoint_path} "
+                f"({n_unexpected} unexpected keys) -- key namespaces do not match."
             )
             if not load_params_only:
                 if not skip_load_optimizer:
