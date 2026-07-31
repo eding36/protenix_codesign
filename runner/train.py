@@ -19,7 +19,7 @@ import os
 import time
 from argparse import Namespace
 from contextlib import nullcontext
-from typing import Any, Dict, Mapping, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -526,6 +526,50 @@ class AF3Trainer(object):
     # loop definition of the numbering scheme being reported.
     _H3_LOOP_STEM = 2
 
+    def _make_gt_sequence_batch(self, batch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Build the pass-2 batch: the native CDR sequence instead of the masked one.
+
+        Structure quality must be scored on a structure the model built for the
+        *correct* sequence -- otherwise a per-CDR RMSD compares the native loop
+        against a loop made of different residues, and conflates design error with
+        folding error.
+
+        Two feature edits do it:
+
+        * ``restype`` is rebuilt as a clean one-hot of ``seq`` (the featurizer had
+          overwritten CDR positions with UNK), so the trunk sees the real residues;
+        * ``cdr_mask`` is zeroed, so the sequence diffusion corrupts nothing and the
+          decode returns the given sequence unchanged.
+
+        Returns ``None`` for non-codesign batches, where no second pass is needed.
+
+        Note: the MSA/profile CDR columns stay scrubbed. The native identity is
+        supplied through ``restype`` only, which is the conservative choice -- it
+        never re-opens the MSA leak path.
+        """
+        feats = batch.get("input_feature_dict") or {}
+        if "cdr_mask" not in feats or "seq" not in feats or "restype" not in feats:
+            return None
+        cdr_mask = feats["cdr_mask"]
+        if not bool(cdr_mask.any()):
+            return None  # nothing was designed -> pass 1 already used the native seq
+
+        new_feats = dict(feats)
+        vocab = feats["restype"].shape[-1]
+        new_feats["restype"] = (
+            torch.nn.functional.one_hot(feats["seq"].long(), num_classes=vocab)
+            .to(feats["restype"].dtype)
+        )
+        new_feats["cdr_mask"] = torch.zeros_like(cdr_mask)
+        # Drop any per-step sequence-diffusion state so pass 2 starts clean.
+        for key in ("masked_seq", "seq_mask", "time"):
+            new_feats.pop(key, None)
+
+        new_batch = dict(batch)
+        new_batch["input_feature_dict"] = new_feats
+        new_batch.pop("pred_dict", None)
+        return new_batch
+
     def _log_structure_design(
         self,
         batch: Dict[str, Any],
@@ -752,6 +796,21 @@ class AF3Trainer(object):
                 evaluated_pids.append(pid)
 
                 simple_metrics = {}
+                # Antibody codesign is evaluated in two passes, because the two
+                # metrics answer different questions and cannot share a forward:
+                #
+                #   Pass 1 (design)    masked CDR sequence in -> the model designs the
+                #                      sequence and generates a matching structure.
+                #                      Scored by per-CDR AAR. Its coordinates belong to
+                #                      the DESIGNED sequence, so comparing them against
+                #                      the native ones would measure two different
+                #                      molecules -- no RMSD is taken here.
+                #   Pass 2 (structure) native CDR sequence in -> the model only has to
+                #                      fold it. Scored by framework-aligned per-CDR Ca
+                #                      RMSD, which is now a like-for-like comparison.
+                #
+                # Non-codesign runs have no pass 2 and score RMSD off pass 1.
+                gt_seq_batch = self._make_gt_sequence_batch(batch)
                 with enable_amp:
                     # Model forward
                     batch, _ = self.model_forward(batch, mode=mode)
@@ -765,14 +824,23 @@ class AF3Trainer(object):
                     )
                     simple_metrics.update(loss_dict)
 
+                # Pass 1 -> sequence recovery only.
                 self._log_sequence_design(
                     batch, simple_metrics, test_name, ema_suffix
                 )
-                # Framework-aligned per-CDR Ca RMSD + Loop-RMSD, and the predicted
-                # structure superposed onto the native frame.
-                self._log_structure_design(
-                    batch, simple_metrics, test_name, ema_suffix
-                )
+
+                # Pass 2 -> structure given the native sequence.
+                if gt_seq_batch is not None:
+                    with enable_amp:
+                        gt_seq_batch, _ = self.model_forward(gt_seq_batch, mode=mode)
+                    self._log_structure_design(
+                        gt_seq_batch, simple_metrics, test_name, ema_suffix
+                    )
+                    del gt_seq_batch
+                else:
+                    self._log_structure_design(
+                        batch, simple_metrics, test_name, ema_suffix
+                    )
 
                 # Update metric aggregator
                 for key, value in simple_metrics.items():
