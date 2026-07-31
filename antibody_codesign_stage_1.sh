@@ -35,6 +35,8 @@ torchrun --standalone --nproc_per_node=1 /home/dinge/Protenix/runner/train.py \
 --use_wandb true \
 --diffusion_batch_size 48 \
 --eval_interval 5000 \
+--eval_ema_only true \
+--test_max_n_token 3840 \
 --log_interval 50 \
 --checkpoint_interval 400 \
 --ema_decay 0.999 \

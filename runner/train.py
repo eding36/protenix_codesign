@@ -490,6 +490,200 @@ class AF3Trainer(object):
             self._evaluate(ema_suffix=f"ema{self.ema_wrapper.decay}_", mode=mode)
             self.ema_wrapper.restore()
 
+    # Antibody region bookkeeping for the codesign eval metrics.
+    # chain_type: 1=Heavy, 2=Light, 3=Antigen. region_type: Chothia fr1..fr4 = 1,3,5,7
+    # and cdr1..cdr3 = 2,4,6 (see protenix/data/antibody_cdr.py).
+    _CDR_REGIONS = {
+        "H1": (1, 2), "H2": (1, 4), "H3": (1, 6),
+        "L1": (2, 2), "L2": (2, 4), "L3": (2, 6),
+    }
+    _FRAMEWORK_REGIONS = (1, 3, 5, 7)
+    # Loop-RMSD: number of stem/anchor residues trimmed from each end of CDR-H3 so
+    # only the central (apex) loop residues remain. ASSUMPTION -- adjust to match the
+    # loop definition of the numbering scheme being reported.
+    _H3_LOOP_STEM = 2
+
+    def _log_structure_design(
+        self,
+        batch: Dict[str, Any],
+        simple_metrics: Dict[str, Any],
+        test_name: str,
+        ema_suffix: str = "",
+    ) -> None:
+        """Add framework-aligned per-CDR Ca RMSD metrics and dump predicted structures.
+
+        Follows the DiffAb protocol: the antibody **framework** Ca atoms are superposed
+        first, then the CDR deviation is measured without any per-loop re-alignment.
+        Reports ``rmsd/{H1,H2,H3,L1,L2,L3}`` plus ``rmsd/H3_loop`` (Loop-RMSD: the
+        central CDR-H3 residues, stem trimmed by ``_H3_LOOP_STEM``).
+
+        The predicted structure is written **already superposed onto the native frame**,
+        so prediction and reference can be loaded together without further alignment.
+
+        Best-effort: any failure is logged and swallowed so an eval never aborts.
+        """
+        try:
+            atom_array = batch.get("cropped_atom_array")
+            pred = batch.get("pred_dict") or {}
+            label = batch.get("label_dict") or {}
+            pred_coord, gt_coord = pred.get("coordinate"), label.get("coordinate")
+            ifd = batch.get("input_feature_dict") or {}
+            if atom_array is None or pred_coord is None or gt_coord is None:
+                return
+            if "region_type" not in ifd or "chain_type" not in ifd:
+                return
+
+            import numpy as np
+
+            from protenix.metrics.rmsd import weighted_rigid_align
+
+            n_atom = gt_coord.shape[-2]
+            p = pred_coord.reshape(-1, n_atom, 3)[0].float()  # first design
+            g = gt_coord.reshape(-1, n_atom, 3)[0].float()
+            gm = label.get("coordinate_mask")
+            resolved = (
+                gm.reshape(-1, n_atom)[0].bool()
+                if gm is not None
+                else torch.ones(n_atom, dtype=torch.bool, device=p.device)
+            )
+            a2t = ifd["atom_to_token_idx"].reshape(-1).long()
+            region = ifd["region_type"].reshape(-1).long()[a2t]  # per atom
+            chain = ifd["chain_type"].reshape(-1).long()[a2t]
+            is_ca = torch.as_tensor(
+                np.asarray(atom_array.atom_name) == "CA", device=p.device
+            )
+            if is_ca.shape[0] != n_atom:
+                return
+
+            fw_regions = torch.tensor(self._FRAMEWORK_REGIONS, device=p.device)
+            framework = (
+                is_ca & resolved & (chain > 0) & (chain < 3) & torch.isin(region, fw_regions)
+            )
+            if int(framework.sum()) < 3:
+                return
+            aligned = weighted_rigid_align(
+                p.unsqueeze(0), g.unsqueeze(0), framework.float().unsqueeze(0)
+            )
+            if isinstance(aligned, (tuple, list)):
+                aligned = aligned[0]
+            aligned = aligned.reshape(n_atom, 3)
+
+            def _ca_rmsd(mask: torch.Tensor):
+                if int(mask.sum()) == 0:
+                    return None
+                return (aligned[mask] - g[mask]).pow(2).sum(-1).mean().sqrt().item()
+
+            for name, (ct, rt) in self._CDR_REGIONS.items():
+                value = _ca_rmsd(is_ca & resolved & (chain == ct) & (region == rt))
+                if value is not None:
+                    simple_metrics[f"rmsd/{name}"] = value
+
+            # Loop-RMSD over the central CDR-H3 residues (atoms are in residue order).
+            h3 = (is_ca & resolved & (chain == 1) & (region == 6)).nonzero().flatten()
+            stem = self._H3_LOOP_STEM
+            if h3.numel() > 2 * stem:
+                loop = h3[stem:-stem]
+                simple_metrics["rmsd/H3_loop"] = (
+                    (aligned[loop] - g[loop]).pow(2).sum(-1).mean().sqrt().item()
+                )
+
+            if DIST_WRAPPER.rank != 0:
+                return
+            import copy
+
+            from biotite.structure.io.pdbx import CIFFile, set_structure
+
+            pid = batch["basic"]["pdb_id"]
+            out_dir = os.path.join(
+                self.structure_dir, f"{test_name}_step{self.step}_{ema_suffix or 'raw'}"
+            )
+            os.makedirs(out_dir, exist_ok=True)
+            pred_array = copy.deepcopy(atom_array)
+            pred_array.coord = aligned.detach().cpu().numpy()
+            pred_array.bonds = None  # biotite bond export is not needed here
+            cif = CIFFile()
+            set_structure(cif, pred_array)
+            cif.write(os.path.join(out_dir, f"{pid}.cif"))
+        except Exception as e:  # noqa: BLE001 - never break an eval pass
+            logging.warning("Structure-design logging failed: %s", e)
+
+    def _log_sequence_design(
+        self,
+        batch: Dict[str, Any],
+        simple_metrics: Dict[str, Any],
+        test_name: str,
+        ema_suffix: str = "",
+    ) -> None:
+        """Add per-CDR AAR metrics to training eval.
+
+        Only active when the model returned
+        a decoded sequence (``pred_dict["sequence"]``) together with the ground truth
+        and the design mask. Adds ``aar/*`` entries to ``simple_metrics`` (so they
+        flow into the normal aggregator and wandb) and appends the design to a
+        per-eval FASTA + ``.seq`` TSV under ``prediction_dir``, matching MFDesign's
+        writer output (Rank/Sequence/Total/H/L/PerCDR).
+
+        Any failure here is logged and swallowed: a metrics/IO problem must never
+        abort an evaluation pass.
+        """
+        try:
+            pred = batch.get("pred_dict") or {}
+            seq_pred = pred.get("sequence")
+            seq_gt = pred.get("seq_gt")
+            cdr_mask = pred.get("cdr_mask")
+            if seq_pred is None or seq_gt is None or cdr_mask is None:
+                return
+            if not seq_pred.is_floating_point():
+                # Eval emits decoded token ids; take the first design if batched.
+                n_token = seq_gt.reshape(-1, seq_gt.shape[-1]).shape[-1]
+                pred_ids = seq_pred.reshape(-1, n_token)[0]
+            else:  # logits (shouldn't happen in eval, but stay defensive)
+                pred_ids = seq_pred.reshape(-1, seq_pred.shape[-1]).argmax(dim=-1)
+            gt_ids = seq_gt.reshape(-1, seq_gt.shape[-1])[0]
+            cdr = cdr_mask.reshape(-1, cdr_mask.shape[-1])[0].bool()
+            if int(cdr.sum()) == 0:
+                return
+
+            from protenix.metrics.sequence_recovery import calculate_aar
+            from protenix.model.sequence_decode import token_ids_to_letters
+
+            aar = calculate_aar(pred_ids, gt_ids, cdr)
+            simple_metrics["aar/total"] = aar["total"]
+            simple_metrics["aar/heavy"] = aar["heavy"]
+            simple_metrics["aar/light"] = aar["light"]
+            # Name the loops when the segment count matches the canonical layout
+            # (MFDesign's positional convention: first three heavy, last three light).
+            per_cdr = aar["per_cdr"]
+            if len(per_cdr) == 6:
+                names = ["H1", "H2", "H3", "L1", "L2", "L3"]
+            elif len(per_cdr) == 3:
+                names = ["H1", "H2", "H3"]
+            else:
+                names = [f"cdr{i + 1}" for i in range(len(per_cdr))]
+            for name, value in zip(names, per_cdr):
+                simple_metrics[f"aar/{name}"] = value
+
+            if DIST_WRAPPER.rank != 0:
+                return
+            pid = batch["basic"]["pdb_id"]
+            tag = f"{test_name}_step{self.step}_{ema_suffix or 'raw'}"
+            letters = token_ids_to_letters(pred_ids)
+            per_cdr_str = "\t".join(f"{v:.3f}" for v in per_cdr)
+            fasta_path = os.path.join(self.prediction_dir, f"{tag}.fasta")
+            seq_path = os.path.join(self.prediction_dir, f"{tag}.seq")
+            if not os.path.exists(seq_path):
+                with open(seq_path, "w") as f:
+                    f.write("PDB\tSequence\tTotal\tH\tL\tN_designed\tPerCDR\n")
+            with open(fasta_path, "a") as f:
+                f.write(f">{pid}\n{letters}\n")
+            with open(seq_path, "a") as f:
+                f.write(
+                    f"{pid}\t{letters}\t{aar['total']:.3f}\t{aar['heavy']:.3f}\t"
+                    f"{aar['light']:.3f}\t{aar['n_designed']}\t{per_cdr_str}\n"
+                )
+        except Exception as e:  # noqa: BLE001 - never break an eval pass
+            logging.warning("Sequence-design logging failed: %s", e)
+
     @torch.no_grad()
     def _evaluate(self, ema_suffix: str = "", mode: str = "eval") -> None:
         """
@@ -547,6 +741,15 @@ class AF3Trainer(object):
                         {k: v for k, v in lddt_metrics.items() if "diff" not in k}
                     )
                     simple_metrics.update(loss_dict)
+
+                self._log_sequence_design(
+                    batch, simple_metrics, test_name, ema_suffix
+                )
+                # Framework-aligned per-CDR Ca RMSD + Loop-RMSD, and the predicted
+                # structure superposed onto the native frame.
+                self._log_structure_design(
+                    batch, simple_metrics, test_name, ema_suffix
+                )
 
                 # Update metric aggregator
                 for key, value in simple_metrics.items():

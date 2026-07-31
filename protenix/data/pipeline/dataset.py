@@ -86,6 +86,7 @@ class BaseSingleDataset(Dataset):
         self.find_pocket = kwargs.get("find_pocket", False)
         self.find_all_pockets = kwargs.get("find_all_pockets", False)  # for dev
         self.find_eval_chain_interface = kwargs.get("find_eval_chain_interface", False)
+        self.return_atom_token_array = kwargs.get("return_atom_token_array", False)
         self.group_by_pdb_id = kwargs.get("group_by_pdb_id", False)  # for test set
         self.sort_by_n_token = kwargs.get("sort_by_n_token", False)
 
@@ -338,7 +339,7 @@ class BaseSingleDataset(Dataset):
         # Try at most 10 times
         for _ in range(10):
             try:
-                data = self.process_one(idx)
+                data = self.process_one(idx, self.return_atom_token_array)
                 return data
             except Exception as e:
                 error_message = f"{e} at idx {idx}:\n{traceback.format_exc()}"

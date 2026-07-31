@@ -25,13 +25,13 @@ export LAYERNORM_TYPE=torch
 # Specify your data root directory by uncommenting the following line.
 export PROTENIX_ROOT_DIR="/home/dinge/data/proj/protenix_codesign/data"
 # wget -P $PROTENIX_ROOT_DIR/checkpoint/ https://protenix.tos-cn-beijing.volces.com/checkpoint/protenix_base_default_v1.0.0.pt
-checkpoint_path="/home/dinge/Protenix/output/protenix_antibody_codesign_stage_1_20260727_102716/checkpoints/stage_1.pt"
+checkpoint_path="/home/dinge/Protenix/output/protenix_antibody_codesign_stage_1_20260729_103800/checkpoints/stage_1.pt"
 torchrun --standalone --nproc_per_node=1 /home/dinge/Protenix/runner/train.py \
 --model_name "protenix_base_default_v1.0.0_codesign" \
 --run_name protenix_antibody_codesign_stage_2 \
 --seed 42 \
 --base_dir ./output \
---dtype fp32 \
+--dtype bf16 \
 --project protenix \
 --use_wandb true \
 --diffusion_batch_size 32 \
@@ -39,12 +39,15 @@ torchrun --standalone --nproc_per_node=1 /home/dinge/Protenix/runner/train.py \
 --log_interval 50 \
 --checkpoint_interval 400 \
 --ema_decay 0.999 \
+--eval_ema_only true \
+--test_max_n_token 2048 \
 --train_crop_size 384 \
 --max_steps 100000 \
 --warmup_steps 2000 \
 --lr 0.001 \
 --model.N_cycle 4 \
 --sample_diffusion.N_step 200 \
+--sample_diffusion.N_sample 1 \
 --triangle_attention "torch" \
 --triangle_multiplicative "torch" \
 --load_checkpoint_path ${checkpoint_path} \

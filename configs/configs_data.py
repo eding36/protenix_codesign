@@ -282,6 +282,7 @@ data_configs = {
             "pdb_list": "",
             "find_pocket": False,
             "find_all_pockets": False,
+            "return_atom_token_array": True,
             "max_n_token": GlobalConfigValue("test_max_n_token"),  # filter data
         },
         **deepcopy(default_test_configs),

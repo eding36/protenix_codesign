@@ -27,7 +27,7 @@ export PROTENIX_ROOT_DIR="/home/dinge/data/proj/protenix_codesign/data"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ---- what to evaluate -------------------------------------------------------
-RUN_DIR="./output/protenix_antibody_codesign_stage_1_20260727_102716"
+RUN_DIR="./output/protenix_antibody_codesign_stage_1_20260729_103800"
 # Default to the final EMA weights (what you'd normally report); override with CKPT.
 # Raw (non-EMA) final weights are at ${RUN_DIR}/checkpoints/stage_1.pt
 CKPT="${CKPT:-${RUN_DIR}/checkpoints/stage_1.pt}"
