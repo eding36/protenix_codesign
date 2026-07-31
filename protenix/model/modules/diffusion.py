@@ -350,6 +350,7 @@ class DiffusionModule(nn.Module):
         sequence_model_args: Optional[dict[str, Any]] = None,
         sequence_noise_type: str = "discrete_uniform",
         N_steps_seq: int = 200,
+        torsion_noise_prob: float = 0.0,
     ) -> None:
         super(DiffusionModule, self).__init__()
         self.sigma_data = sigma_data
@@ -380,6 +381,9 @@ class DiffusionModule(nn.Module):
         """Sequence denoising head, codesign implementation"""
         self.sequence_train = sequence_train
         self.sequence_noise_type = sequence_noise_type
+        # Probability a training step uses bond-length-preserving torsion noising
+        # instead of EDM Gaussian noise (see protenix/model/torsion_noise.py).
+        self.torsion_noise_prob = torsion_noise_prob
         self.N_steps_seq = N_steps_seq
         if sequence_train:
             if sequence_model_args is None:

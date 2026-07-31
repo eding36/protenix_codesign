@@ -33,6 +33,11 @@ basic_configs = {
     "finetune_params_with_substring": [
         ""
     ],  # params with substring will be finetuned with different learning rate: finetune_optim_configs["lr"]
+    # Probability that a training step noises structures in TORSION space
+    # (bond-length / bond-angle preserving) instead of the default EDM Gaussian.
+    # 0.0 = pure EDM (original behaviour), 1.0 = always torsion. Mixing keeps the
+    # model competent on both noise distributions.
+    "torsion_noise_prob": 0.0,
     "eval_only": False,
     "load_checkpoint_path": "",
     "load_ema_checkpoint_path": "",

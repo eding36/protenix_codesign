@@ -746,7 +746,41 @@ class Featurizer(object):
 
         mask_features = self.get_mask_features()
         features.update(mask_features)
+
+        features.update(self.get_torsion_features())
         return features
+
+    def get_torsion_features(self) -> dict[str, torch.Tensor]:
+        """Rotatable-torsion index for bond-length-preserving (torsion) noising.
+
+        Pure topology -- which atoms rotate about which bond -- so it carries no
+        coordinate information and is safe as a model input. Built here because the
+        diffusion module only ever sees tensors, not the AtomArray.
+
+        Empty tensors when connectivity is unavailable, which makes the caller fall
+        back to ordinary Gaussian noising.
+        """
+        from protenix.model.torsion_noise import (
+            build_torsion_index,
+            torsion_index_to_tensors,
+        )
+
+        atom_array = self.cropped_atom_array
+        n_atoms = len(atom_array)
+        bonds = None
+        if getattr(atom_array, "bonds", None) is not None:
+            bonds = atom_array.bonds.as_array()[:, :2]
+        if n_atoms == 0 or bonds is None or len(bonds) == 0:
+            return torsion_index_to_tensors([])
+        residue_starts = get_residue_starts(atom_array, add_exclusive_stop=True)
+        torsions = build_torsion_index(
+            atom_array.atom_name,
+            atom_array.res_name,
+            residue_starts,
+            n_atoms,
+            bonds=bonds,
+        )
+        return torsion_index_to_tensors(torsions)
 
     def get_labels(self) -> dict[str, torch.Tensor]:
         """

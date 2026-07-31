@@ -14,6 +14,7 @@
 
 from typing import Any, Callable, Optional
 
+import random
 import torch
 from torch.distributions.categorical import Categorical
 from torch.nn.functional import one_hot
@@ -21,6 +22,7 @@ from protenix.data import constants
 from einops import rearrange
 
 from protenix.model.sequence_decode import decode_sequence
+from protenix.model.torsion_noise import apply_torsion_noise
 from protenix.model.utils import centre_random_augmentation
 from protenix.tfg import parse_tfg_config, TFGEngine
 from protenix.utils.logger import get_logger
@@ -593,6 +595,7 @@ def sample_diffusion_training(
     noise_type: str = "discrete_uniform",
     n_steps_seq: int = 200,
     seq_sigma_schedule: Optional[torch.Tensor] = None,
+    torsion_noise_prob: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Implements diffusion training as described in AF3 Appendix at page 23.
     It performances denoising steps from time 0 to time T.
@@ -666,6 +669,42 @@ def sample_diffusion_training(
     # noise: [..., N_sample, N_atom, 3]
     noise = torch.randn_like(x_gt_augment, dtype=dtype) * sigma[..., None, None]
 
+    # Torsion-space noising (bond-length preserving). With probability
+    # ``torsion_noise_prob`` this step perturbs rotatable side-chain torsions
+    # instead of displacing those atoms with iid Gaussian noise, so bond lengths,
+    # bond angles and chirality of the moved substructures stay exact and the
+    # denoiser does not spend capacity restoring local covalent geometry.
+    # The decision is per training step, so the model sees both noise
+    # distributions and never becomes dependent on either.
+    # NOTE: only atoms downstream of a rotatable bond can move this way (~30% of a
+    # typical antibody complex -- backbone torsions are excluded because their
+    # lever arm makes displacement-per-radian wildly non-uniform). Atoms no torsion
+    # reaches keep the ordinary Gaussian noise so the structure is fully noised.
+    x_noisy_override = None
+    if (
+        torsion_noise_prob > 0.0
+        and random.random() < torsion_noise_prob
+        and input_feature_dict.get("torsion_pivot") is not None
+        and input_feature_dict["torsion_pivot"].numel() > 0
+    ):
+        torsion_atom = input_feature_dict["torsion_atom"]
+        x_noisy_override = apply_torsion_noise(
+            x_gt_augment,
+            input_feature_dict["torsion_pivot"],
+            input_feature_dict["torsion_depth"],
+            torsion_atom,
+            input_feature_dict["torsion_atom_id"],
+            sigma,
+        )
+        # Gaussian on everything the torsions could not reach.
+        residual = torch.ones(
+            x_gt_augment.shape[-2], dtype=torch.bool, device=x_gt_augment.device
+        )
+        residual[torsion_atom] = False
+        x_noisy_override = torch.where(
+            residual[..., None], x_gt_augment + noise, x_noisy_override
+        )
+
     """Sequence noising process, only at CDR residues"""
     if sequence_train:
         # One diffusion timestep per SEQUENCE (MFDesign samples per-sequence, not
@@ -707,7 +746,7 @@ def sample_diffusion_training(
     # (x_denoised, k_denoised); k_denoised is None unless the model is sequence_train.
     if diffusion_chunk_size is None:
         x_denoised, k_denoised = denoise_net(
-            x_noisy=x_gt_augment + noise,
+            x_noisy=(x_noisy_override if x_noisy_override is not None else x_gt_augment + noise),
             t_hat_noise_level=sigma,
             input_feature_dict=input_feature_dict,
             s_inputs=s_inputs,

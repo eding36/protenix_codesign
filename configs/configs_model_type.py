@@ -48,6 +48,8 @@
 
 
 """
+from protenix.config.extend_types import GlobalConfigValue
+
 model_configs = {
     "protenix-v2": {
         "c_z": 256,
@@ -96,6 +98,9 @@ model_configs = {
                 "sequence_train": True,
                 "sequence_noise_type": "discrete_uniform",
                 "N_steps_seq": 200,
+                # Share the top-level torsion/EDM mixing probability so it can be
+                # set per model as well as from the training CLI.
+                "torsion_noise_prob": GlobalConfigValue("torsion_noise_prob"),
                 "sequence_model_args": {
                     "hidden_dim": 768,
                     "vocab_size": 20,

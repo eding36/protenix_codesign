@@ -83,11 +83,12 @@ def build_torsion_index(
         bonds: ``[N_bond, 2]`` atom-index pairs used to validate each candidate.
 
     Returns:
-        List of ``(pivot_a, pivot_b, moved_indices)``: rotate ``moved_indices``
-        about the axis through atoms ``pivot_a -> pivot_b``.
+        List of ``(pivot_a, pivot_b, moved_indices, depth)``: rotate ``moved_indices``
+        about the axis through atoms ``pivot_a -> pivot_b``. ``depth`` is the chi
+        level, used to batch independent rotations.
     """
     torsions = []
-    candidates: "list[tuple[int, int]]" = []
+    candidates: "list[tuple[int, int, int]]" = []
     for r in range(len(residue_starts) - 1):
         start, stop = residue_starts[r], residue_starts[r + 1]
         order = SC_ORDER.get(res_names[start])
@@ -99,18 +100,111 @@ def build_torsion_index(
             continue
         # Chain of pivots: (CA, CB), (CB, CG), (CG, CD), ...
         chain = ["CA"] + [a for a in order if a in idx_of]
+        # depth i == chi(i+1); torsions at one depth move disjoint atom sets.
         candidates.extend(
-            (idx_of[chain[i]], idx_of[chain[i + 1]]) for i in range(len(chain) - 2)
+            (idx_of[chain[i]], idx_of[chain[i + 1]], i) for i in range(len(chain) - 2)
         )
 
     if bonds is None or len(bonds) == 0:
         return []  # without connectivity we cannot build correct downstream sets
     adjacency = _adjacency(bonds, n_atoms)
-    for a, b in candidates:
+    for a, b, depth in candidates:
         moved = _downstream(a, b, adjacency)
         if moved is not None and moved.size:
-            torsions.append((a, b, moved))
+            torsions.append((a, b, moved, depth))
     return torsions
+
+
+def torsion_index_to_tensors(
+    torsions: "list[tuple[int, int, np.ndarray, int]]",
+) -> "dict[str, torch.Tensor]":
+    """Flatten a torsion index into padding-free tensors for the feature dict.
+
+    Returns:
+        torsion_pivot   [T, 2]  the two axis atoms of each torsion
+        torsion_depth   [T]     chi level (0 = chi1); torsions at the same depth
+            touch disjoint atom sets, so a whole depth can be rotated at once.
+        torsion_atom    [K]     atom indices moved by some torsion
+        torsion_atom_id [K]     which torsion each entry in ``torsion_atom`` belongs to
+    """
+    if not torsions:
+        return {
+            "torsion_pivot": torch.zeros((0, 2), dtype=torch.long),
+            "torsion_depth": torch.zeros((0,), dtype=torch.long),
+            "torsion_atom": torch.zeros((0,), dtype=torch.long),
+            "torsion_atom_id": torch.zeros((0,), dtype=torch.long),
+        }
+    pivots, depths, atoms, atom_ids = [], [], [], []
+    for tid, (a, b, moved, depth) in enumerate(torsions):
+        pivots.append((a, b))
+        depths.append(depth)
+        atoms.append(moved)
+        atom_ids.append(np.full(moved.shape, tid, dtype=np.int64))
+    return {
+        "torsion_pivot": torch.tensor(pivots, dtype=torch.long),
+        "torsion_depth": torch.tensor(depths, dtype=torch.long),
+        "torsion_atom": torch.from_numpy(np.concatenate(atoms)),
+        "torsion_atom_id": torch.from_numpy(np.concatenate(atom_ids)),
+    }
+
+
+def apply_torsion_noise(
+    coords: torch.Tensor,
+    torsion_pivot: torch.Tensor,
+    torsion_depth: torch.Tensor,
+    torsion_atom: torch.Tensor,
+    torsion_atom_id: torch.Tensor,
+    sigma: torch.Tensor,
+    max_angle: float = float(np.pi),
+) -> torch.Tensor:
+    """Vectorised torsion-space noising of a coordinate tensor.
+
+    Torsions sharing a depth act on disjoint atom sets, so each depth is applied in
+    one batched rotation; only the (at most four) chi levels are sequential, rather
+    than every torsion. Nested torsions therefore compose correctly -- chi2 rotates
+    about the axis chi1 has already moved.
+
+    Args:
+        coords: ``[..., N_atom, 3]``
+        sigma: ``[...]`` noise level in Angstrom, broadcast over leading dims.
+
+    Returns:
+        ``[..., N_atom, 3]`` with all bond lengths and bond angles preserved.
+    """
+    if torsion_pivot.numel() == 0:
+        return coords
+    out = coords.clone()
+    n_torsion = torsion_pivot.shape[0]
+    # sigma (A) -> angular scale: a moved atom sits ~2 A from its axis, so a
+    # rotation of theta displaces it by ~2*theta.
+    theta_scale = (sigma / 2.0).clamp(max=max_angle)
+    angles = torch.randn(
+        (*theta_scale.shape, n_torsion), device=coords.device, dtype=coords.dtype
+    ) * theta_scale[..., None]
+
+    for depth in torsion_depth.unique(sorted=True):
+        at_depth = torsion_depth == depth
+        entries = at_depth[torsion_atom_id]
+        if not bool(entries.any()):
+            continue
+        aidx = torsion_atom[entries]
+        tid = torsion_atom_id[entries]
+        pa = out[..., torsion_pivot[tid, 0], :]
+        pb = out[..., torsion_pivot[tid, 1], :]
+        ang = angles[..., tid]
+        axis = pb - pa
+        axis = axis / axis.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        v = out[..., aidx, :] - pb
+        cos_t = torch.cos(ang)[..., None]
+        sin_t = torch.sin(ang)[..., None]
+        dot = (v * axis).sum(-1, keepdim=True)
+        out[..., aidx, :] = (
+            v * cos_t
+            + torch.cross(axis, v, dim=-1) * sin_t
+            + axis * dot * (1 - cos_t)
+            + pb
+        )
+    return out
 
 
 def _adjacency(bonds: np.ndarray, n_atoms: int) -> "list[list[int]]":
@@ -208,7 +302,7 @@ class TorsionNoiser:
         self.n_atoms = n_atoms
         self.max_angle = max_angle
         moved = np.zeros(n_atoms, dtype=bool)
-        for _, _, m in self.torsions:
+        for _, _, m, _d in self.torsions:
             moved[m] = True
         # Atoms no torsion can move (backbone, Gly/Ala side chains, ligands, ions,
         # nucleic acids). Callers apply ordinary Gaussian noise to these.
@@ -241,7 +335,7 @@ class TorsionNoiser:
         # by ~ r * theta with r its distance to the axis (~1.5-3 A), so theta ~
         # sigma / r_typ. Clamped so high-sigma steps stay within a full turn.
         theta_scale = (sigma / 2.0).clamp(max=self.max_angle)
-        for pivot_a, pivot_b, moved in self.torsions:
+        for pivot_a, pivot_b, moved, _d in self.torsions:
             idx = torch.as_tensor(moved, device=coords.device)
             shape = theta_scale.shape
             angle = torch.randn(shape, device=coords.device, dtype=coords.dtype,

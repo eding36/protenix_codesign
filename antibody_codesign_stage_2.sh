@@ -28,7 +28,7 @@ export PROTENIX_ROOT_DIR="/home/dinge/data/proj/protenix_codesign/data"
 checkpoint_path="/home/dinge/Protenix/output/protenix_antibody_codesign_stage_1_20260729_103800/checkpoints/stage_1.pt"
 torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --model_name "protenix_base_default_v1.0.0_codesign" \
---run_name protenix_antibody_codesign_stage_2_structural_tokendenoiser \
+--run_name protenix_antibody_codesign_stage_2_angular_diffusion \
 --seed 42 \
 --base_dir ./output \
 --dtype bf16 \

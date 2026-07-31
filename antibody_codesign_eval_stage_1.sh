@@ -48,7 +48,7 @@ LOG="${RUN_DIR}/eval_$(basename "${CKPT}" .pt).log"
 CUDA_VISIBLE_DEVICES="${GPU}" torchrun --standalone --nproc_per_node=1 \
   /home/dinge/Protenix/runner/train.py \
   --model_name "protenix_base_default_v1.0.0_codesign" \
-  --run_name protenix_antibody_codesign_stage_1_eval_structural_tokendenoiser \
+  --run_name protenix_antibody_codesign_stage_1_eval_angular_diffusion \
   --seed 42 \
   --base_dir ./output \
   --dtype bf16 \
