@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 export PYTHONPATH="${PYTHONPATH}:$(pwd)"
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0,1
 # fast_layernorm is used by default, no need to set explicitly. Set LAYERNORM_TYPE=torch to disable.
 # NOTE: the fused fast_layernorm CUDA kernel is NOT built for Blackwell (sm_120) and
 # silently returns its input UNNORMALIZED there, so the pair rep explodes to NaN.
@@ -26,7 +26,7 @@ export LAYERNORM_TYPE=torch
 export PROTENIX_ROOT_DIR="/home/dinge/data/proj/protenix_codesign/data"
 # wget -P $PROTENIX_ROOT_DIR/checkpoint/ https://protenix.tos-cn-beijing.volces.com/checkpoint/protenix_base_default_v1.0.0.pt
 checkpoint_path="/home/dinge/Protenix/output/protenix_antibody_codesign_stage_1_20260729_103800/checkpoints/stage_1.pt"
-torchrun --standalone --nproc_per_node=1 /home/dinge/Protenix/runner/train.py \
+torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --model_name "protenix_base_default_v1.0.0_codesign" \
 --run_name protenix_antibody_codesign_stage_2_structural_tokendenoiser \
 --seed 42 \
