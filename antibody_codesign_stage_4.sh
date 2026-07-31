@@ -25,7 +25,7 @@ checkpoint_path="${PROTENIX_ROOT_DIR}/output/protenix_antibody_codesign_stage_3_
 
 python3 /home/dinge/Protenix/runner/train.py \
 --model_name "protenix_base_default_v1.0.0_codesign" \
---run_name protenix_antibody_codesign_stage_4 \
+--run_name protenix_antibody_codesign_stage_4_structural_tokendenoiser \
 --seed 42 \
 --base_dir ./output \
 --dtype bf16 \
