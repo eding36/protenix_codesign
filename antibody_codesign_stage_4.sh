@@ -57,7 +57,7 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --data.template.enable_prot_template false \
 --data.msa.enable_prot_msa true \
 --data.msa.enable_rna_msa false \
---loss.weight.alpha_sequence 2.0 \
+--loss.weight.alpha_sequence 1.0 \
 --antibody_add_antigen true \
 --antibody_min_neighborhood 0 \
 --antibody_max_neighborhood 40 \
