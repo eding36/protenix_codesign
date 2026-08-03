@@ -33,6 +33,10 @@ basic_configs = {
     "finetune_params_with_substring": [
         ""
     ],  # params with substring will be finetuned with different learning rate: finetune_optim_configs["lr"]
+    # Replacement sampling at eval (MFDesign Alg. S3): pin the native framework /
+    # antigen and generate only the CDRs, conditioning the design on the given
+    # co-crystal structure. Off by default -- it changes what the metrics mean.
+    "eval_structure_inpainting": False,
     "eval_only": False,
     "load_checkpoint_path": "",
     "load_ema_checkpoint_path": "",
