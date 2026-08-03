@@ -575,8 +575,10 @@ class AF3Trainer(object):
             # replacement sampling) plus the region metadata, and
             # scripts/cdr_rmsd_benchmark.py does the PyRosetta pack/relax, the
             # framework-Ca superposition and the per-CDR RMSD.
-            if DIST_WRAPPER.rank != 0:
-                return
+            # NOT rank-gated: under DDP the test set is split across ranks, so
+            # gating here would silently dump only rank 0's share and the offline
+            # CDR RMSD benchmark would score a half-sized set without complaining.
+            # Every file below is named per-PDB, so ranks write disjoint paths.
             import copy
             import json
 
@@ -712,14 +714,21 @@ class AF3Trainer(object):
             for name, value in zip(names, per_cdr):
                 simple_metrics[f"aar/{name}"] = value
 
-            if DIST_WRAPPER.rank != 0:
-                return
+            # NOT rank-gated, for the same reason as the structure dump: each rank
+            # sees a disjoint shard of the test set. These two are shared *append*
+            # targets though, so they get a per-rank suffix -- concurrent "a" writes
+            # can interleave, and the truncating "w" below would race one rank's
+            # header against another's accumulated rows. Concatenate the shards
+            # afterwards: cat <tag>_rank*.fasta > <tag>.fasta
             pid = batch["basic"]["pdb_id"]
             tag = f"{test_name}_step{self.step}_{ema_suffix or 'raw'}"
+            shard = (
+                f"_rank{DIST_WRAPPER.rank}" if DIST_WRAPPER.world_size > 1 else ""
+            )
             letters = token_ids_to_letters(pred_ids)
             per_cdr_str = "\t".join(f"{v:.3f}" for v in per_cdr)
-            fasta_path = os.path.join(self.prediction_dir, f"{tag}.fasta")
-            seq_path = os.path.join(self.prediction_dir, f"{tag}.seq")
+            fasta_path = os.path.join(self.prediction_dir, f"{tag}{shard}.fasta")
+            seq_path = os.path.join(self.prediction_dir, f"{tag}{shard}.seq")
             if not os.path.exists(seq_path):
                 with open(seq_path, "w") as f:
                     f.write("PDB\tSequence\tTotal\tH\tL\tN_designed\tPerCDR\n")
