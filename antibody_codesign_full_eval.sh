@@ -46,10 +46,16 @@ TORCHRUN="${TORCHRUN:-/home/dinge/miniconda3/envs/protenix/bin/torchrun}"
 # ---- preflight ---------------------------------------------------------------
 # A 2-3 day run must not die on something knowable in the first second.
 
+# This script lives on codesign, angular_diffusion and structural_tokendenoiser,
+# which train different models -- so the guard is against launching a multi-day
+# run from whichever branch happened to be checked out, not against any one
+# branch. Override when you genuinely mean to evaluate another one.
+EXPECT_BRANCH="${EXPECT_BRANCH:-codesign}"
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-if [[ "${BRANCH}" != "codesign" ]]; then
-  echo "[error] on branch '${BRANCH}', expected 'codesign'." >&2
-  echo "        run: git checkout codesign" >&2
+if [[ "${BRANCH}" != "${EXPECT_BRANCH}" ]]; then
+  echo "[error] on branch '${BRANCH}', expected '${EXPECT_BRANCH}'." >&2
+  echo "        git checkout ${EXPECT_BRANCH}    (to evaluate that branch)" >&2
+  echo "        EXPECT_BRANCH=${BRANCH} bash $0  (to evaluate this one)" >&2
   exit 1
 fi
 
