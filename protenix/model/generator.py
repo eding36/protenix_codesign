@@ -318,6 +318,38 @@ def _sequence_reverse_step(
     return Categorical(probs=post).sample().squeeze(0)  # ids, no +2
 
 
+def _replace_fixed_atoms(
+    x: torch.Tensor, x_gt: torch.Tensor, gen_mask: torch.Tensor
+) -> torch.Tensor:
+    """Rigid-align the ground truth onto ``x`` and substitute the fixed atoms.
+
+    Implements MFDesign Alg. S3 lines 14-15 / 23-24. ``gen_mask`` is True for atoms
+    the model is allowed to generate (the CDR atoms, plus any atom with no
+    ground-truth coordinate); everything else is taken from the aligned reference.
+
+    The alignment is weighted onto the *fixed* atoms, since those are the ones being
+    substituted -- aligning on the generated region would drag the framework.
+    """
+    from protenix.metrics.rmsd import weighted_rigid_align
+
+    fixed_w = (~gen_mask).to(x.dtype)
+    if float(fixed_w.sum()) == 0:
+        return x
+    # Kabsch alignment goes through SVD, which CUDA does not implement for bf16
+    # ("svd_cuda_gesvdjBatched"). Casting the inputs is not enough -- eval runs inside
+    # torch.autocast(bfloat16), which would re-cast the matmuls -- so autocast has to
+    # be disabled for the superposition itself.
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        aligned = weighted_rigid_align(
+            x_gt.expand_as(x).contiguous().float(),
+            x.float(),
+            fixed_w.expand(x.shape[:-1]).float(),
+        )
+    if isinstance(aligned, (tuple, list)):
+        aligned = aligned[0]
+    return torch.where(gen_mask[..., None], x, aligned.to(x.dtype))
+
+
 def sample_diffusion(
     denoise_net: Callable,
     input_feature_dict: dict[str, Any],
@@ -345,6 +377,8 @@ def sample_diffusion(
     restype_width: Optional[int] = None,
     seq_temperature: float = 1.0,
     seq_sample: bool = True,
+    inpaint_coords: Optional[torch.Tensor] = None,
+    inpaint_gen_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Implements Algorithm 18 in AF3.
     It performances denoising steps from time 0 to time T.
@@ -507,6 +541,20 @@ def sample_diffusion(
                     enable_efficient_fusion=enable_efficient_fusion,
                 )
 
+                # Replacement sampling (MFDesign Alg. S3 lines 14-15; RePaint,
+                # Lugmayr et al. 2022). Condition the design on the given co-crystal
+                # structure: rigid-align the ground truth onto the current denoised
+                # estimate, then keep the model's coordinates only inside the CDRs and
+                # take the aligned ground truth everywhere else. Applied to x_denoised
+                # (the x0 estimate) rather than x_l, so the sampler's own next step
+                # re-noises the replaced region to the following level -- this is what
+                # makes it equivalent to RePaint's "forward noised counterpart" without
+                # an explicit re-noising term.
+                if inpaint_coords is not None:
+                    x_denoised = _replace_fixed_atoms(
+                        x_denoised, inpaint_coords, inpaint_gen_mask
+                    )
+
                 delta = (x_noisy - x_denoised) / t_hat[
                     ..., None, None
                 ]  # Line 9 of AF3 uses 'x_l_hat' instead, which we believe  is a typo.
@@ -527,6 +575,11 @@ def sample_diffusion(
                         cdr_corrupter, seq_noisy, seq_logits, gt_ids, cdr_mask,
                         t_seq, noise_type, seq_temperature, seq_sample,
                     )
+
+        # Alg. S3 lines 23-24: final replacement so the returned structure carries
+        # the native framework exactly, not merely a well-aligned approximation.
+        if inpaint_coords is not None:
+            x_l = _replace_fixed_atoms(x_l, inpaint_coords, inpaint_gen_mask)
 
         if seq_rollout and k_denoised is not None: #at final time step t_0, decode sequence logits -> final designed CDR sequence
             # Final decode: designed residues from the last logits, framework from GT.
