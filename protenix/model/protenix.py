@@ -605,19 +605,17 @@ class Protenix(nn.Module):
                 restype_width=len(STD_RESIDUES_WITH_GAP),
             )
         # Replacement sampling (MFDesign Alg. S3): condition the CDR design on the
-        # given co-crystal structure. Atoms the model may generate = CDR atoms (via
-        # design_mask, which survives the pass-2 zeroing of cdr_mask) plus any atom
-        # without a ground-truth coordinate. Everything else is replaced each step by
-        # the rigid-aligned ground truth. Off unless eval_structure_inpainting is set.
+        # given co-crystal structure. Atoms the model may generate = CDR atoms plus
+        # any atom without a ground-truth coordinate; everything else is replaced each
+        # step by the rigid-aligned ground truth. Off unless
+        # eval_structure_inpainting is set.
         inpaint_coords = inpaint_gen_mask = None
         if (
             getattr(self.configs, "eval_structure_inpainting", False)
             and label_dict is not None
             and label_dict.get("coordinate") is not None
         ):
-            design_tok = input_feature_dict.get("design_mask")
-            if design_tok is None:
-                design_tok = input_feature_dict.get("cdr_mask")
+            design_tok = input_feature_dict.get("cdr_mask")
             if design_tok is not None and bool(design_tok.any()):
                 a2t = input_feature_dict["atom_to_token_idx"].long()
                 gen = design_tok.reshape(-1).bool()[a2t]

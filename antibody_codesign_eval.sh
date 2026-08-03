@@ -60,7 +60,7 @@ CUDA_VISIBLE_DEVICES="${GPU}" torchrun --standalone --nproc_per_node=1 \
   --data.num_dl_workers 2 \
   --model.N_cycle 4 \
   --sample_diffusion.N_step 200 \
-  --sample_diffusion.N_sample 1 \
+  --sample_diffusion.N_sample "${N_SAMPLE:-20}" \
   --skip_amp.sample_diffusion false \
   --triangle_attention "cuequivariance" \
   --triangle_multiplicative "cuequivariance" \

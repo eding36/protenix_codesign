@@ -526,55 +526,6 @@ class AF3Trainer(object):
     # loop definition of the numbering scheme being reported.
     _H3_LOOP_STEM = 2
 
-    def _make_gt_sequence_batch(self, batch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Build the pass-2 batch: the native CDR sequence instead of the masked one.
-
-        Structure quality must be scored on a structure the model built for the
-        *correct* sequence -- otherwise a per-CDR RMSD compares the native loop
-        against a loop made of different residues, and conflates design error with
-        folding error.
-
-        Two feature edits do it:
-
-        * ``restype`` is rebuilt as a clean one-hot of ``seq`` (the featurizer had
-          overwritten CDR positions with UNK), so the trunk sees the real residues;
-        * ``cdr_mask`` is zeroed, so the sequence diffusion corrupts nothing and the
-          decode returns the given sequence unchanged.
-
-        Returns ``None`` for non-codesign batches, where no second pass is needed.
-
-        Note: the MSA/profile CDR columns stay scrubbed. The native identity is
-        supplied through ``restype`` only, which is the conservative choice -- it
-        never re-opens the MSA leak path.
-        """
-        feats = batch.get("input_feature_dict") or {}
-        if "cdr_mask" not in feats or "seq" not in feats or "restype" not in feats:
-            return None
-        cdr_mask = feats["cdr_mask"]
-        if not bool(cdr_mask.any()):
-            return None  # nothing was designed -> pass 1 already used the native seq
-
-        new_feats = dict(feats)
-        vocab = feats["restype"].shape[-1]
-        new_feats["restype"] = (
-            torch.nn.functional.one_hot(feats["seq"].long(), num_classes=vocab)
-            .to(feats["restype"].dtype)
-        )
-        # Keep the original design region under a separate key. Replacement sampling
-        # needs to know which atoms the model may generate, and cdr_mask is zeroed
-        # here to stop the sequence diffusion -- keying inpainting off it would pin
-        # every atom and yield a meaningless RMSD of ~0.
-        new_feats["design_mask"] = cdr_mask.clone()
-        new_feats["cdr_mask"] = torch.zeros_like(cdr_mask)
-        # Drop any per-step sequence-diffusion state so pass 2 starts clean.
-        for key in ("masked_seq", "seq_mask", "time"):
-            new_feats.pop(key, None)
-
-        new_batch = dict(batch)
-        new_batch["input_feature_dict"] = new_feats
-        new_batch.pop("pred_dict", None)
-        return new_batch
-
     def _log_structure_design(
         self,
         batch: Dict[str, Any],
@@ -582,17 +533,11 @@ class AF3Trainer(object):
         test_name: str,
         ema_suffix: str = "",
     ) -> None:
-        """Add framework-aligned per-CDR Ca RMSD metrics and dump predicted structures.
+        """Write every predicted structure plus the region metadata for Benchmark 2.
 
-        Follows the DiffAb protocol: the antibody **framework** Ca atoms are superposed
-        first, then the CDR deviation is measured without any per-loop re-alignment.
-        Reports ``rmsd/{H1,H2,H3,L1,L2,L3}`` plus ``rmsd/H3_loop`` (Loop-RMSD: the
-        central CDR-H3 residues, stem trimmed by ``_H3_LOOP_STEM``).
+        No metrics are computed here ``scripts/cdr_rmsd_benchmark.py`` does the
+        PyRosetta pack/relax, the framework-Ca superposition and then outputs per-CDR RMSD.
 
-        The predicted structure is written **already superposed onto the native frame**,
-        so prediction and reference can be loaded together without further alignment.
-
-        Best-effort: any failure is logged and swallowed so an eval never aborts.
         """
         try:
             atom_array = batch.get("cropped_atom_array")
@@ -607,61 +552,33 @@ class AF3Trainer(object):
 
             import numpy as np
 
-            from protenix.metrics.rmsd import weighted_rigid_align
-
             n_atom = gt_coord.shape[-2]
-            p = pred_coord.reshape(-1, n_atom, 3)[0].float()  # first design
+            all_p = pred_coord.reshape(-1, n_atom, 3).float()  # one row per sample
             g = gt_coord.reshape(-1, n_atom, 3)[0].float()
             gm = label.get("coordinate_mask")
             resolved = (
                 gm.reshape(-1, n_atom)[0].bool()
                 if gm is not None
-                else torch.ones(n_atom, dtype=torch.bool, device=p.device)
+                else torch.ones(n_atom, dtype=torch.bool, device=all_p.device)
             )
             a2t = ifd["atom_to_token_idx"].reshape(-1).long()
             region = ifd["region_type"].reshape(-1).long()[a2t]  # per atom
             chain = ifd["chain_type"].reshape(-1).long()[a2t]
             is_ca = torch.as_tensor(
-                np.asarray(atom_array.atom_name) == "CA", device=p.device
+                np.asarray(atom_array.atom_name) == "CA", device=all_p.device
             )
             if is_ca.shape[0] != n_atom:
                 return
 
-            fw_regions = torch.tensor(self._FRAMEWORK_REGIONS, device=p.device)
-            framework = (
-                is_ca & resolved & (chain > 0) & (chain < 3) & torch.isin(region, fw_regions)
-            )
-            if int(framework.sum()) < 3:
-                return
-            aligned = weighted_rigid_align(
-                p.unsqueeze(0), g.unsqueeze(0), framework.float().unsqueeze(0)
-            )
-            if isinstance(aligned, (tuple, list)):
-                aligned = aligned[0]
-            aligned = aligned.reshape(n_atom, 3)
-
-            def _ca_rmsd(mask: torch.Tensor):
-                if int(mask.sum()) == 0:
-                    return None
-                return (aligned[mask] - g[mask]).pow(2).sum(-1).mean().sqrt().item()
-
-            for name, (ct, rt) in self._CDR_REGIONS.items():
-                value = _ca_rmsd(is_ca & resolved & (chain == ct) & (region == rt))
-                if value is not None:
-                    simple_metrics[f"rmsd/{name}"] = value
-
-            # Loop-RMSD over the central CDR-H3 residues (atoms are in residue order).
-            h3 = (is_ca & resolved & (chain == 1) & (region == 6)).nonzero().flatten()
-            stem = self._H3_LOOP_STEM
-            if h3.numel() > 2 * stem:
-                loop = h3[stem:-stem]
-                simple_metrics["rmsd/H3_loop"] = (
-                    (aligned[loop] - g[loop]).pow(2).sum(-1).mean().sqrt().item()
-                )
-
+            # No RMSD is computed here. Benchmark 2 is a separate offline step:
+            # this pass only writes every predicted structure (already conditioned by
+            # replacement sampling) plus the region metadata, and
+            # scripts/cdr_rmsd_benchmark.py does the PyRosetta pack/relax, the
+            # framework-Ca superposition and the per-CDR RMSD.
             if DIST_WRAPPER.rank != 0:
                 return
             import copy
+            import json
 
             from biotite.structure.io.pdbx import CIFFile, set_structure
 
@@ -670,12 +587,52 @@ class AF3Trainer(object):
                 self.structure_dir, f"{test_name}_step{self.step}_{ema_suffix or 'raw'}"
             )
             os.makedirs(out_dir, exist_ok=True)
-            pred_array = copy.deepcopy(atom_array)
-            pred_array.coord = aligned.detach().cpu().numpy()
-            pred_array.bonds = None  # biotite bond export is not needed here
+
+            # One CIF per diffusion sample, in the model's own frame (no alignment --
+            # the benchmark script superposes after relax).
+            for row in range(all_p.shape[0]):
+                pred_array = copy.deepcopy(atom_array)
+                pred_array.coord = all_p[row].detach().cpu().numpy()
+                pred_array.bonds = None  # biotite bond export is not needed here
+                cif = CIFFile()
+                set_structure(cif, pred_array)
+                cif.write(os.path.join(out_dir, f"{pid}_sample{row}.cif"))
+
+            # Ground truth in the identical atom ordering, so the benchmark script
+            # never has to re-derive the correspondence.
+            gt_array = copy.deepcopy(atom_array)
+            gt_array.coord = g.detach().cpu().numpy()
+            gt_array.bonds = None
             cif = CIFFile()
-            set_structure(cif, pred_array)
-            cif.write(os.path.join(out_dir, f"{pid}.cif"))
+            set_structure(cif, gt_array)
+            cif.write(os.path.join(out_dir, f"{pid}_native.cif"))
+
+            # Region metadata: which residues are framework (align on these) and which
+            # are CDRs (score these), keyed by chain/res_id so it survives PyRosetta.
+            ca_idx = is_ca.nonzero().flatten().tolist()
+            centre = [
+                {
+                    "chain": str(atom_array.chain_id[i]),
+                    "res_id": int(atom_array.res_id[i]),
+                    "res_name": str(atom_array.res_name[i]),
+                    "chain_type": int(chain[i]),      # 1=H, 2=L, 3=antigen
+                    "region_type": int(region[i]),    # Chothia fr1..fr4=1,3,5,7; cdr1..3=2,4,6
+                    "resolved": bool(resolved[i]),
+                }
+                for i in ca_idx
+            ]
+            with open(os.path.join(out_dir, f"{pid}_regions.json"), "w") as fh:
+                json.dump(
+                    {
+                        "pdb_id": pid,
+                        "n_samples": int(all_p.shape[0]),
+                        "cdr_regions": self._CDR_REGIONS,
+                        "framework_regions": list(self._FRAMEWORK_REGIONS),
+                        "h3_loop_stem": self._H3_LOOP_STEM,
+                        "residues": centre,
+                    },
+                    fh,
+                )
         except Exception as e:  # noqa: BLE001 - never break an eval pass
             logging.warning("Structure-design logging failed: %s", e)
 
@@ -705,12 +662,12 @@ class AF3Trainer(object):
             cdr_mask = pred.get("cdr_mask")
             if seq_pred is None or seq_gt is None or cdr_mask is None:
                 return
+            n_token = seq_gt.reshape(-1, seq_gt.shape[-1]).shape[-1]
             if not seq_pred.is_floating_point():
-                # Eval emits decoded token ids; take the first design if batched.
-                n_token = seq_gt.reshape(-1, seq_gt.shape[-1]).shape[-1]
-                pred_ids = seq_pred.reshape(-1, n_token)[0]
+                # Eval emits decoded token ids, one row per diffusion sample.
+                all_pred = seq_pred.reshape(-1, n_token)
             else:  # logits (shouldn't happen in eval, but stay defensive)
-                pred_ids = seq_pred.reshape(-1, seq_pred.shape[-1]).argmax(dim=-1)
+                all_pred = seq_pred.reshape(-1, n_token, seq_pred.shape[-1]).argmax(-1)
             gt_ids = seq_gt.reshape(-1, seq_gt.shape[-1])[0]
             cdr = cdr_mask.reshape(-1, cdr_mask.shape[-1])[0].bool()
             if int(cdr.sum()) == 0:
@@ -719,7 +676,27 @@ class AF3Trainer(object):
             from protenix.metrics.sequence_recovery import calculate_aar
             from protenix.model.sequence_decode import token_ids_to_letters
 
-            aar = calculate_aar(pred_ids, gt_ids, cdr)
+            # With N_sample > 1 the model emits several independent designs. Report the
+            # MEAN recovery over them, not the best: taking the best would select on
+            # the very metric being reported and rise with N_sample for free.
+            per_sample = [
+                calculate_aar(all_pred[row], gt_ids, cdr)
+                for row in range(all_pred.shape[0])
+            ]
+            n_s = len(per_sample)
+            n_cdr = min(len(a["per_cdr"]) for a in per_sample)
+            aar = {
+                "total": sum(a["total"] for a in per_sample) / n_s,
+                "heavy": sum(a["heavy"] for a in per_sample) / n_s,
+                "light": sum(a["light"] for a in per_sample) / n_s,
+                "per_cdr": [
+                    sum(a["per_cdr"][i] for a in per_sample) / n_s
+                    for i in range(n_cdr)
+                ],
+                "n_designed": per_sample[0]["n_designed"],
+            }
+            pred_ids = all_pred[0]  # representative design for the FASTA/.seq dump
+            simple_metrics["aar/n_samples"] = float(n_s)
             simple_metrics["aar/total"] = aar["total"]
             simple_metrics["aar/heavy"] = aar["heavy"]
             simple_metrics["aar/light"] = aar["light"]
