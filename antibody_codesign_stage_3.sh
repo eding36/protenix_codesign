@@ -48,8 +48,8 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --model.N_cycle 4 \
 --sample_diffusion.N_step 200 \
 --sample_diffusion.N_sample 1 \
---triangle_attention "torch" \
---triangle_multiplicative "torch" \
+--triangle_attention "cuequivariance" \
+--triangle_multiplicative "cuequivariance" \
 --load_checkpoint_path ${checkpoint_path} \
 --load_ema_checkpoint_path ${checkpoint_path} \
 --data.train_sets antibody_codesign_train_set \
