@@ -777,44 +777,57 @@ class AF3Trainer(object):
                         break
                 evaluated_pids.append(pid)
 
-                simple_metrics = {}
-                with enable_amp:
-                    # Model forward
-                    batch, _ = self.model_forward(batch, mode=mode)
-                    # Loss forward
-                    _, loss_dict, batch = self.get_loss(batch, mode="eval")
-                    # lDDT metrics
-                    lddt_dict = self.get_metrics(batch)
-                    lddt_metrics = self.aggregate_metrics(lddt_dict, batch)
-                    simple_metrics.update(
-                        {k: v for k, v in lddt_metrics.items() if "diff" not in k}
-                    )
-                    simple_metrics.update(loss_dict)
+                # A single OOM (or any per-structure failure) must not abort the
+                # whole pass -- a full-test-set eval at large N_sample runs for
+                # many hours, and the uncropped complexes vary hugely in size.
+                # Skip the offending structure and carry on; it is simply absent
+                # from the aggregate, and the skip is logged loudly.
+                try:
+                    simple_metrics = {}
+                    with enable_amp:
+                        # Model forward
+                        batch, _ = self.model_forward(batch, mode=mode)
+                        # Loss forward
+                        _, loss_dict, batch = self.get_loss(batch, mode="eval")
+                        # lDDT metrics
+                        lddt_dict = self.get_metrics(batch)
+                        lddt_metrics = self.aggregate_metrics(lddt_dict, batch)
+                        simple_metrics.update(
+                            {k: v for k, v in lddt_metrics.items() if "diff" not in k}
+                        )
+                        simple_metrics.update(loss_dict)
 
-                # Both metrics come from this single design pass, matching the
-                # reference protocol (Alg. S3 emits one sequence + structure pair):
-                #   AAR  - designed sequence vs native sequence
-                #   RMSD - designed CDR backbone vs native, framework-aligned
-                # RMSD is Ca-only, and every amino acid has a Ca, so comparing the
-                # designed loop's trace against the native one is well defined even
-                # where the designed residues differ.
-                self._log_sequence_design(
-                    batch, simple_metrics, test_name, ema_suffix
-                )
-                self._log_structure_design(
-                    batch, simple_metrics, test_name, ema_suffix
-                )
-
-                # Update metric aggregator
-                for key, value in simple_metrics.items():
-                    simple_metric_wrapper.add(
-                        f"{ema_suffix}{key}", value, namespace=test_name
+                    # Both metrics come from this single design pass, matching the
+                    # reference protocol (Alg. S3 emits one sequence + structure pair):
+                    #   AAR  - designed sequence vs native sequence
+                    #   RMSD - designed CDR backbone vs native, framework-aligned
+                    # RMSD is Ca-only, and every amino acid has a Ca, so comparing the
+                    # designed loop's trace against the native one is well defined even
+                    # where the designed residues differ.
+                    self._log_sequence_design(
+                        batch, simple_metrics, test_name, ema_suffix
                     )
+                    self._log_structure_design(
+                        batch, simple_metrics, test_name, ema_suffix
+                    )
+
+                    # Update metric aggregator
+                    for key, value in simple_metrics.items():
+                        simple_metric_wrapper.add(
+                            f"{ema_suffix}{key}", value, namespace=test_name
+                        )
+                except Exception as exc:  # noqa: BLE001 - report and keep going
+                    logging.error(
+                        f"Rank {DIST_WRAPPER.rank}: SKIPPING {pid} in {test_name} "
+                        f"-- {type(exc).__name__}: {exc}"
+                    )
+                    simple_metrics = None
 
                 del batch, simple_metrics
-                if index % 5 == 0:
-                    # Release memory periodically
-                    torch.cuda.empty_cache()
+                # Every iteration, not every 5: at large N_sample the peak varies
+                # enormously with complex size, and a stale cached block is what
+                # turns a merely large next complex into an OOM.
+                torch.cuda.empty_cache()
 
             metrics = simple_metric_wrapper.calc()
             self.print(f"Step {self.step}, eval {test_name}: {metrics}")

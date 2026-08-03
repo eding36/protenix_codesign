@@ -62,11 +62,20 @@ CDR_REGIONS = {
 }
 
 
-def load_ca(cif_path: str) -> "dict[tuple[str, int], np.ndarray]":
-    """Map (chain, res_id) -> CA coordinate for one structure."""
-    import biotite.structure.io.pdbx as pdbx
+def load_ca(path: str) -> "dict[tuple[str, int], np.ndarray]":
+    """Map (chain, res_id) -> CA coordinate for one structure.
 
-    arr = pdbx.get_structure(pdbx.CIFFile.read(cif_path), model=1)
+    Dispatches on extension: the eval writes CIF, but PyRosetta relax returns PDB,
+    so both have to be readable here.
+    """
+    if path.lower().endswith((".pdb", ".ent")):
+        import biotite.structure.io.pdb as pdb
+
+        arr = pdb.PDBFile.read(path).get_structure(model=1)
+    else:
+        import biotite.structure.io.pdbx as pdbx
+
+        arr = pdbx.get_structure(pdbx.CIFFile.read(path), model=1)
     sel = arr.atom_name == "CA"
     return {
         (str(c), int(r)): xyz
@@ -94,7 +103,20 @@ def relax_with_pyrosetta(cif_path: str, out_path: str) -> Optional[str]:
     if not getattr(relax_with_pyrosetta, "_init", False):
         pyrosetta.init("-mute all -ex1 -ex2aro", silent=True)
         relax_with_pyrosetta._init = True
-    pose = pyrosetta.pose_from_file(cif_path)
+
+    # PyRosetta's mmCIF reader rejects the minimal CIF biotite emits ("There are
+    # multiple blocks in the file"), so round-trip through PDB, which both agree on.
+    import biotite.structure.io.pdb as biotite_pdb
+    import biotite.structure.io.pdbx as biotite_pdbx
+
+    tmp_pdb = out_path.replace(".pdb", "_in.pdb")
+    arr = biotite_pdbx.get_structure(biotite_pdbx.CIFFile.read(cif_path), model=1)
+    arr.bonds = None
+    pdb_f = biotite_pdb.PDBFile()
+    pdb_f.set_structure(arr)
+    pdb_f.write(tmp_pdb)
+
+    pose = pyrosetta.pose_from_file(tmp_pdb)
     scorefxn = pyrosetta.get_fa_scorefxn()
     fr = FastRelax(scorefxn, 1)  # one repeat: pack + minimise
     fr.apply(pose)
