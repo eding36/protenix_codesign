@@ -12,7 +12,8 @@
 # CDR RMSD is NOT computed here -- it is a separate offline pass over the dumped
 # structures (scripts/cdr_rmsd_benchmark.py); the command is printed at the end.
 #
-# RUNTIME: at N_SAMPLE=20 this is roughly 2-3 DAYS on one GPU. The 200-step
+# RUNTIME: at N_SAMPLE=20 this is roughly 2-3 DAYS on ONE GPU, ~half that split
+# across two (default GPU=0,1 -> one rank per GPU). The 200-step
 # diffusion loop dominates and scales with N_SAMPLE; inpainting adds an fp32
 # Kabsch SVD at every step. Start it under tmux/nohup:
 #
@@ -27,7 +28,10 @@ set -euo pipefail
 cd /home/dinge/Protenix
 
 # ---- knobs -------------------------------------------------------------------
-GPU="${GPU:-0}"
+# Comma-separated GPU list; one rank per GPU. Safe under DDP now that the dump
+# functions are no longer rank-gated (each rank writes its own disjoint shard).
+GPU="${GPU:-0,1}"
+NPROC="$(awk -F, '{print NF}' <<< "${GPU}")"
 N_SAMPLE="${N_SAMPLE:-20}"
 INPAINT="${INPAINT:-true}"
 MAX_TOKEN="${MAX_TOKEN:-3840}"
@@ -64,15 +68,14 @@ if [[ ! -x "${TORCHRUN}" ]]; then
   fi
 fi
 
-# Single GPU deliberately: _log_sequence_design/_log_structure_design both
-# early-return on rank != 0, so a multi-rank run would silently dump only the
-# rank-0 share of structures and quietly halve the benchmark.
-USED_MIB="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "${GPU}" 2>/dev/null || echo 0)"
-if (( USED_MIB > 2000 )); then
-  echo "[warn] GPU ${GPU} already has ${USED_MIB} MiB in use -- risk of OOM." >&2
-  echo "       ctrl-C within 10s to abort, or set GPU=<other>." >&2
-  sleep 10
-fi
+for g in ${GPU//,/ }; do
+  USED_MIB="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "${g}" 2>/dev/null || echo 0)"
+  if (( USED_MIB > 2000 )); then
+    echo "[warn] GPU ${g} already has ${USED_MIB} MiB in use -- risk of OOM." >&2
+    echo "       ctrl-C within 10s to abort, or set GPU=<other>." >&2
+    sleep 10
+  fi
+done
 
 # ---- environment -------------------------------------------------------------
 export PYTHONPATH="${PYTHONPATH:-}:/home/dinge/Protenix"
@@ -90,7 +93,7 @@ mkdir -p "$(dirname "${LOG}")"
 
 echo "branch     : ${BRANCH}"
 echo "checkpoint : ${CKPT}"
-echo "GPU        : ${GPU}  (single-rank; see note above)"
+echo "GPU        : ${GPU}  (${NPROC} rank(s))"
 echo "N_sample   : ${N_SAMPLE}    inpainting: ${INPAINT}    max tokens: ${MAX_TOKEN}"
 echo "log        : ${LOG}"
 echo
@@ -98,7 +101,7 @@ echo
 # ---- run ---------------------------------------------------------------------
 # Note: --ema_decay 0 means "no EMA wrapper"; if CKPT is itself an *_ema_*.pt
 # file its weights are still used verbatim, they just are not re-averaged.
-CUDA_VISIBLE_DEVICES="${GPU}" "${TORCHRUN}" --standalone --nproc_per_node=1 \
+CUDA_VISIBLE_DEVICES="${GPU}" "${TORCHRUN}" --standalone --nproc_per_node="${NPROC}" \
   /home/dinge/Protenix/runner/train.py \
   --model_name "protenix_base_default_v1.0.0_codesign" \
   --run_name "${RUN_NAME}" \
@@ -143,6 +146,12 @@ echo
 echo "Structures dumped to:"
 echo "    ${PRED_DIR}"
 echo
+if (( NPROC > 1 )); then
+  echo "Multi-rank run: sequences are sharded per rank. Merge them with"
+  echo "    cat ${OUT}/predictions/*_rank*.fasta > ${OUT}/predictions/all.fasta"
+  echo "(structures are per-PDB and need no merging)."
+  echo
+fi
 echo "Now compute CDR RMSD offline (geometry only, fast):"
 echo "    python scripts/cdr_rmsd_benchmark.py \\"
 echo "        --pred_dir ${PRED_DIR} \\"
