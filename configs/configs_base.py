@@ -38,6 +38,10 @@ basic_configs = {
     # 0.0 = pure EDM (original behaviour), 1.0 = always torsion. Mixing keeps the
     # model competent on both noise distributions.
     "torsion_noise_prob": 0.0,
+    # Replacement sampling at eval (MFDesign Alg. S3): pin the native framework /
+    # antigen and generate only the CDRs, conditioning the design on the given
+    # co-crystal structure. Off by default -- it changes what the metrics mean.
+    "eval_structure_inpainting": False,
     "eval_only": False,
     "load_checkpoint_path": "",
     "load_ema_checkpoint_path": "",

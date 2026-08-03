@@ -26,7 +26,7 @@ export PROTENIX_ROOT_DIR="/home/dinge/data/proj/protenix_codesign/data"
 # allocator can grow segments instead of failing on a big contiguous request).
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# ---- what to evaluate -------------------------------------------------------
+# ---- what to evaluate (CHANGE L30) -------------------------------------------------------
 RUN_DIR="./output/protenix_antibody_codesign_stage_1_20260729_103800"
 # Default to the final EMA weights (what you'd normally report); override with CKPT.
 # Raw (non-EMA) final weights are at ${RUN_DIR}/checkpoints/stage_1.pt
@@ -53,6 +53,7 @@ CUDA_VISIBLE_DEVICES="${GPU}" torchrun --standalone --nproc_per_node=1 \
   --base_dir ./output \
   --dtype bf16 \
   --eval_only true \
+  --eval_structure_inpainting "${INPAINT:-true}" \
   --ema_decay 0 \
   --use_wandb false \
   --load_checkpoint_path "${CKPT}" \

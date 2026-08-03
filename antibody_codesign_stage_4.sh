@@ -44,7 +44,7 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --train_crop_size 512 \
 --max_steps 100000 \
 --warmup_steps 2000 \
---lr 0.001 \
+--lr 0.0002 \
 --model.N_cycle 4 \
 --sample_diffusion.N_step 200 \
 --sample_diffusion.N_sample 1 \

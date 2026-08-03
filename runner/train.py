@@ -560,6 +560,11 @@ class AF3Trainer(object):
             torch.nn.functional.one_hot(feats["seq"].long(), num_classes=vocab)
             .to(feats["restype"].dtype)
         )
+        # Keep the original design region under a separate key. Replacement sampling
+        # needs to know which atoms the model may generate, and cdr_mask is zeroed
+        # here to stop the sequence diffusion -- keying inpainting off it would pin
+        # every atom and yield a meaningless RMSD of ~0.
+        new_feats["design_mask"] = cdr_mask.clone()
         new_feats["cdr_mask"] = torch.zeros_like(cdr_mask)
         # Drop any per-step sequence-diffusion state so pass 2 starts clean.
         for key in ("masked_seq", "seq_mask", "time"):
@@ -796,21 +801,6 @@ class AF3Trainer(object):
                 evaluated_pids.append(pid)
 
                 simple_metrics = {}
-                # Antibody codesign is evaluated in two passes, because the two
-                # metrics answer different questions and cannot share a forward:
-                #
-                #   Pass 1 (design)    masked CDR sequence in -> the model designs the
-                #                      sequence and generates a matching structure.
-                #                      Scored by per-CDR AAR. Its coordinates belong to
-                #                      the DESIGNED sequence, so comparing them against
-                #                      the native ones would measure two different
-                #                      molecules -- no RMSD is taken here.
-                #   Pass 2 (structure) native CDR sequence in -> the model only has to
-                #                      fold it. Scored by framework-aligned per-CDR Ca
-                #                      RMSD, which is now a like-for-like comparison.
-                #
-                # Non-codesign runs have no pass 2 and score RMSD off pass 1.
-                gt_seq_batch = self._make_gt_sequence_batch(batch)
                 with enable_amp:
                     # Model forward
                     batch, _ = self.model_forward(batch, mode=mode)
@@ -824,23 +814,19 @@ class AF3Trainer(object):
                     )
                     simple_metrics.update(loss_dict)
 
-                # Pass 1 -> sequence recovery only.
+                # Both metrics come from this single design pass, matching the
+                # reference protocol (Alg. S3 emits one sequence + structure pair):
+                #   AAR  - designed sequence vs native sequence
+                #   RMSD - designed CDR backbone vs native, framework-aligned
+                # RMSD is Ca-only, and every amino acid has a Ca, so comparing the
+                # designed loop's trace against the native one is well defined even
+                # where the designed residues differ.
                 self._log_sequence_design(
                     batch, simple_metrics, test_name, ema_suffix
                 )
-
-                # Pass 2 -> structure given the native sequence.
-                if gt_seq_batch is not None:
-                    with enable_amp:
-                        gt_seq_batch, _ = self.model_forward(gt_seq_batch, mode=mode)
-                    self._log_structure_design(
-                        gt_seq_batch, simple_metrics, test_name, ema_suffix
-                    )
-                    del gt_seq_batch
-                else:
-                    self._log_structure_design(
-                        batch, simple_metrics, test_name, ema_suffix
-                    )
+                self._log_structure_design(
+                    batch, simple_metrics, test_name, ema_suffix
+                )
 
                 # Update metric aggregator
                 for key, value in simple_metrics.items():
