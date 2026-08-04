@@ -474,6 +474,16 @@ class DataPipeline(object):
                 one_sample=one_sample, bioassembly_dict=bioassembly_dict
             )
 
+        # Assembly-expanded duplicates are a sequence leak, not just wasted tokens.
+        # A bioassembly often carries several copies of the same complex (8tg9: chains
+        # D/F are byte-identical heavy chains, E/G identical light chains). Only one
+        # copy is role-resolved and therefore CDR-masked, so the *other* copy sits in
+        # the input with its ground-truth CDR sequence intact and the model can simply
+        # read the answer off it. Cropping hides this during training (the Fv alone
+        # nearly fills crop_size), but the test config uses crop_size=-1, so eval saw
+        # the whole assembly. Keep one copy per entity.
+        antibody_dedup = is_antibody
+
         crop = CropData(
             crop_size=crop_size,
             ref_chain_indices=ref_chain_indices,
@@ -496,6 +506,12 @@ class DataPipeline(object):
         selected_indices, reference_token_index = crop.get_crop_indices(
             crop_method=crop_method
         )
+        if antibody_dedup:
+            selected_indices = DataPipeline.drop_duplicate_assembly_copies(
+                bioassembly_dict=bioassembly_dict,
+                selected_indices=selected_indices,
+                ref_chain_indices=ref_chain_indices,
+            )
         # Prepare msa
         cropped_msa_features = DataPipeline.get_msa_raw_features(
             bioassembly_dict=bioassembly_dict,
@@ -530,6 +546,74 @@ class DataPipeline(object):
             cropped_template_features,
             reference_token_index,
         )
+
+    @staticmethod
+    def drop_duplicate_assembly_copies(
+        bioassembly_dict: dict,
+        selected_indices,
+        ref_chain_indices: list,
+    ):
+        """Keep one chain per entity, dropping assembly-expanded duplicates.
+
+        Entities with only one chain are untouched. Returns ``selected_indices``
+        unchanged if the antibody chains cannot be located, so this can never empty
+        the crop.
+
+        Args:
+            bioassembly_dict: must carry ``token_array`` and ``atom_array``.
+            selected_indices: token indices chosen by the cropper.
+            ref_chain_indices: ``asym_id_int`` of the heavy/light chains.
+
+        Returns:
+            The filtered token indices, in the same order and type as the input.
+        """
+        token_array = bioassembly_dict["token_array"]
+        atom_array = bioassembly_dict["atom_array"]
+
+        sel = np.asarray(selected_indices)
+        if sel.size == 0:
+            return selected_indices
+
+        centre = np.asarray(token_array.get_annotation("centre_atom_index"))[sel]
+        asym = np.asarray(atom_array.asym_id_int)[centre]
+        entity = np.asarray(atom_array.label_entity_id)[centre]
+        coord = np.asarray(atom_array.coord)[centre]
+
+        refs = {int(c) for c in ref_chain_indices if c is not None}
+        anchor_mask = np.isin(asym, list(refs)) if refs else np.zeros_like(asym, bool)
+        if not anchor_mask.any():
+            # No antibody chain in the crop -- nothing to anchor "closest copy" on,
+            # and no CDR mask to leak against. Leave the selection alone.
+            return selected_indices
+        anchor = coord[anchor_mask].mean(axis=0)
+
+        keep_asym: set[int] = set()
+        for ent in np.unique(entity):
+            ent_mask = entity == ent
+            chains = np.unique(asym[ent_mask])
+            ref_chains = [int(a) for a in chains if int(a) in refs]
+            if ref_chains:
+                keep_asym.update(ref_chains)
+            elif len(chains) == 1:
+                keep_asym.add(int(chains[0]))
+            else:
+                closest = min(
+                    (int(a) for a in chains),
+                    key=lambda a: float(
+                        np.linalg.norm(coord[asym == a].mean(axis=0) - anchor)
+                    ),
+                )
+                keep_asym.add(closest)
+
+        keep = np.isin(asym, list(keep_asym))
+        if not keep.any():
+            return selected_indices
+        filtered = sel[keep]
+        if isinstance(selected_indices, torch.Tensor):
+            return torch.as_tensor(
+                filtered, dtype=selected_indices.dtype, device=selected_indices.device
+            )
+        return filtered
 
     @staticmethod
     def save_atoms_to_cif(
