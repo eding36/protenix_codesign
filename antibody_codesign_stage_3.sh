@@ -32,6 +32,7 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --seed 42 \
 --base_dir ./output \
 --dtype bf16 \
+--enable_tf32 true \
 --project protenix \
 --use_wandb true \
 --diffusion_batch_size 8 \

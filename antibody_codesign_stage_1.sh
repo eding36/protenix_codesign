@@ -31,7 +31,8 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --run_name protenix_antibody_codesign_stage_1_discrete_absorb \
 --seed 42 \
 --base_dir ./output \
---dtype fp32 \
+--dtype bf16 \
+--enable_tf32 true \
 --project protenix \
 --use_wandb true \
 --diffusion_batch_size 4 \
