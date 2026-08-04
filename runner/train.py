@@ -826,9 +826,13 @@ class AF3Trainer(object):
                             f"{ema_suffix}{key}", value, namespace=test_name
                         )
                 except Exception as exc:  # noqa: BLE001 - report and keep going
+                    # exc_info: a bare `assert` carries no message, so without the
+                    # traceback the log says only "AssertionError" and there is no
+                    # way to tell which structure-level invariant broke.
                     logging.error(
                         f"Rank {DIST_WRAPPER.rank}: SKIPPING {pid} in {test_name} "
-                        f"-- {type(exc).__name__}: {exc}"
+                        f"-- {type(exc).__name__}: {exc}",
+                        exc_info=True,
                     )
                     simple_metrics = None
 
