@@ -547,7 +547,15 @@ class BaseSingleDataset(Dataset):
             msa_features=cropped_msa_features,
             template_features=cropped_template_features,
             full_atom_array=bioassembly_dict["atom_array"],
-            is_spatial_crop="spatial" in crop_method.lower(),
+            # get_cropped_asym_only: restrict the full-complex label to chains that
+            # survived. Spatial crops need it, and so does "no_crop_dedup", which
+            # drops duplicate assembly copies whole -- otherwise label_full still
+            # describes every copy while the features describe one, and the eval
+            # assert that the two coordinate sets match size fails on every
+            # deduplicated antibody.
+            is_spatial_crop=(
+                "spatial" in crop_method.lower() or crop_method == "no_crop_dedup"
+            ),
             max_entity_mol_id=max_entity_mol_id,
         )
 
