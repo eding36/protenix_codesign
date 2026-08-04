@@ -546,18 +546,7 @@ class BaseSingleDataset(Dataset):
             atom_array=cropped_atom_array,
             msa_features=cropped_msa_features,
             template_features=cropped_template_features,
-            # After "no_crop_dedup" the deduplicated array *is* the full complex:
-            # nothing was cropped, only redundant assembly copies removed. Passing
-            # the original array here would leave label_full describing every copy
-            # while the features describe one, and eval asserts the two coordinate
-            # sets match in size. Filtering by asym is not enough --
-            # get_cropped_asym_only keys on a coarser id, so dropped copies come
-            # back (8tp4: label_full kept asyms 3, 5, 14 that the crop had removed).
-            full_atom_array=(
-                cropped_atom_array
-                if crop_method == "no_crop_dedup"
-                else bioassembly_dict["atom_array"]
-            ),
+            full_atom_array=bioassembly_dict["atom_array"],
             is_spatial_crop="spatial" in crop_method.lower(),
             max_entity_mol_id=max_entity_mol_id,
         )
