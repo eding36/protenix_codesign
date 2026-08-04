@@ -22,6 +22,7 @@ import torch
 from biotite.structure import AtomArray
 from scipy.spatial.distance import cdist
 
+from protenix.data.antibody_cdr import REGION_TYPE_EPITOPE
 from protenix.data.tokenizer import TokenArray
 
 
@@ -424,6 +425,7 @@ def get_antibody_crop_index(
     max_neighborhood: int = 40,
     max_atoms: Optional[int] = None,
     is_fv: Optional[np.ndarray] = None,
+    is_epitope: Optional[np.ndarray] = None,
 ) -> tuple[torch.Tensor, int]:
     """Antibody-centric crop (ported from MFDesign ``AntibodyCropper``).
 
@@ -498,6 +500,10 @@ def get_antibody_crop_index(
 
     reference_token_index = -1
     antigen_mask = (~np.isin(chain_id, ref_chain_indices)) & is_resolved
+    if is_epitope is not None:
+        epitope_seeds = antigen_mask & is_epitope
+        if epitope_seeds.any():
+            antigen_mask = epitope_seeds
     #logic for exploring & adding antigen tokens to the crop
     if add_antigen and ref_chain_indices and antigen_mask.any():
         neighborhood_sizes = list(range(min_neighborhood, max_neighborhood + 1, 2))
@@ -841,6 +847,7 @@ class CropData(object):
 
         is_cdr = None
         is_fv = None
+        is_epitope = None
         tokens = self.token_array.tokens
         if len(tokens) and "is_cdr_residue" in tokens[0]._annot:
             is_cdr = np.asarray(
@@ -851,6 +858,7 @@ class CropData(object):
         if len(tokens) and "region_type" in tokens[0]._annot:
             region_type = np.asarray(self.token_array.get_annotation("region_type"))
             is_fv = (region_type >= 1) & (region_type <= 7)
+            is_epitope = region_type == REGION_TYPE_EPITOPE
 
         return get_antibody_crop_index(
             chain_id=chain_id,
@@ -865,4 +873,5 @@ class CropData(object):
             min_neighborhood=self.antibody_min_neighborhood,
             max_neighborhood=self.antibody_max_neighborhood,
             is_fv=is_fv,
+            is_epitope=is_epitope,
         )
