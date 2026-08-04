@@ -17,6 +17,7 @@ export PYTHONPATH="${PYTHONPATH}:$(pwd)"
 # silently returns its input UNNORMALIZED there, so the pair rep explodes to NaN.
 # Force the native torch LayerNorm on this GPU.
 export LAYERNORM_TYPE=torch
+export CUDA_VISIBLE_DEVICES=0,1
 # Kernel options:
 # - triangle_attention: supports 'triattention', 'cuequivariance', 'deepspeed', 'torch'
 # - triangle_multiplicative: supports 'cuequivariance', 'torch'
@@ -25,15 +26,15 @@ export LAYERNORM_TYPE=torch
 export PROTENIX_ROOT_DIR="/home/dinge/data/proj/protenix_codesign/data"
 # wget -P $PROTENIX_ROOT_DIR/checkpoint/ https://protenix.tos-cn-beijing.volces.com/checkpoint/protenix_base_default_v1.0.0.pt
 checkpoint_path="${PROTENIX_ROOT_DIR}/checkpoint/protenix_base_default_v1.0.0.pt"
-torchrun --standalone --nproc_per_node=1 /home/dinge/Protenix/runner/train.py \
+torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --model_name "protenix_base_default_v1.0.0_codesign" \
---run_name protenix_antibody_codesign_stage_1 \
+--run_name protenix_antibody_codesign_stage_1_discrete_absorb \
 --seed 42 \
 --base_dir ./output \
 --dtype fp32 \
 --project protenix \
 --use_wandb true \
---diffusion_batch_size 48 \
+--diffusion_batch_size 4 \
 --eval_interval 5000 \
 --eval_ema_only true \
 --test_max_n_token 2048 \
@@ -43,7 +44,7 @@ torchrun --standalone --nproc_per_node=1 /home/dinge/Protenix/runner/train.py \
 --train_crop_size 256 \
 --max_steps 100000 \
 --warmup_steps 2000 \
---lr 0.001 \
+--lr 0.0002 \
 --model.N_cycle 4 \
 --sample_diffusion.N_step 200 \
 --triangle_attention "cuequivariance" \
@@ -55,8 +56,9 @@ torchrun --standalone --nproc_per_node=1 /home/dinge/Protenix/runner/train.py \
 --data.template.enable_prot_template false \
 --data.msa.enable_prot_msa true \
 --data.msa.enable_rna_msa false \
---loss.weight.alpha_sequence 2.0 \
+--loss.weight.alpha_sequence 1.0 \
 --antibody_add_antigen false \
 --antibody_min_neighborhood 0 \
 --antibody_max_neighborhood 40 \
---antibody_mixed_prob 0.0
+--model.diffusion_module.sequence_noise_type discrete_absorb \
+--antibody_mixed_prob 0.0 

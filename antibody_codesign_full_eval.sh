@@ -33,6 +33,9 @@ cd /home/dinge/Protenix
 GPU="${GPU:-0,1}"
 NPROC="$(awk -F, '{print NF}' <<< "${GPU}")"
 N_SAMPLE="${N_SAMPLE:-20}"
+# Must match what the checkpoint was TRAINED with: the sampler branches on this,
+# so training absorbing and sampling uniform silently produces garbage.
+SEQ_NOISE="${SEQ_NOISE:-discrete_absorb}"
 INPAINT="${INPAINT:-true}"
 # MAX_TOKEN="${MAX_TOKEN:-3840}"
 MAX_TOKEN="2048"
@@ -102,6 +105,7 @@ echo "branch     : ${BRANCH}"
 echo "checkpoint : ${CKPT}"
 echo "GPU        : ${GPU}  (${NPROC} rank(s))"
 echo "N_sample   : ${N_SAMPLE}    inpainting: ${INPAINT}    max tokens: ${MAX_TOKEN}"
+echo "seq noise  : ${SEQ_NOISE}  (must match training)"
 echo "log        : ${LOG}"
 echo
 
@@ -124,6 +128,7 @@ CUDA_VISIBLE_DEVICES="${GPU}" "${TORCHRUN}" --standalone --nproc_per_node="${NPR
   --model.N_cycle 4 \
   --sample_diffusion.N_step 200 \
   --sample_diffusion.N_sample "${N_SAMPLE}" \
+  --model.diffusion_module.sequence_noise_type "${SEQ_NOISE}" \
   --skip_amp.sample_diffusion false \
   --triangle_attention "cuequivariance" \
   --triangle_multiplicative "cuequivariance" \
@@ -132,7 +137,7 @@ CUDA_VISIBLE_DEVICES="${GPU}" "${TORCHRUN}" --standalone --nproc_per_node="${NPR
   --data.template.enable_prot_template false \
   --data.msa.enable_prot_msa true \
   --data.msa.enable_rna_msa false \
-  --loss.weight.alpha_sequence 2.0 \
+  --loss.weight.alpha_sequence 1.0 \
   --antibody_add_antigen false \
   --antibody_min_neighborhood 0 \
   --antibody_max_neighborhood 40 \

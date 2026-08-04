@@ -25,16 +25,16 @@ export LAYERNORM_TYPE=torch
 # Specify your data root directory by uncommenting the following line.
 export PROTENIX_ROOT_DIR="/home/dinge/data/proj/protenix_codesign/data"
 # wget -P $PROTENIX_ROOT_DIR/checkpoint/ https://protenix.tos-cn-beijing.volces.com/checkpoint/protenix_base_default_v1.0.0.pt
-checkpoint_path="/home/dinge/Protenix/output/protenix_antibody_codesign_stage_3_20260801_090044/checkpoints/stage_3.pt"
+checkpoint_path="/home/dinge/Protenix/output/protenix_antibody_codesign_stage_3_discrete_absorb_20260801_090044/checkpoints/stage_3.pt"
 torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --model_name "protenix_base_default_v1.0.0_codesign" \
---run_name protenix_antibody_codesign_stage_4 \
+--run_name protenix_antibody_codesign_stage_4_discrete_absorb \
 --seed 42 \
 --base_dir ./output \
 --dtype bf16 \
 --project protenix \
 --use_wandb true \
---diffusion_batch_size 32 \
+--diffusion_batch_size 8 \
 --eval_interval 5000 \
 --log_interval 50 \
 --checkpoint_interval 400 \
@@ -61,4 +61,5 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --antibody_add_antigen true \
 --antibody_min_neighborhood 0 \
 --antibody_max_neighborhood 40 \
+--model.diffusion_module.sequence_noise_type discrete_absorb \
 --antibody_mixed_prob 0.5
