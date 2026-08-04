@@ -426,7 +426,26 @@ class DataPipeline(object):
                 cropped_template_features (dict[str, Any]): The cropped template features.
         """
         if crop_size <= 0:
+            # No cropping (the test config's crop_size=-1) still has to deduplicate
+            # antibody assemblies: an unmasked duplicate copy of the designed H/L
+            # chain leaks the CDR sequence outright. This is the branch eval takes,
+            # so the dedup in the cropping path below never runs here.
             selected_indices = None
+            _h, _l = DataPipeline._get_antibody_chains(
+                one_sample=one_sample, bioassembly_dict=bioassembly_dict
+            )
+            if _h is not None or _l is not None:
+                _refs = [c for c in (_h, _l) if c is not None]
+                _n_tok = len(bioassembly_dict["token_array"])
+                _kept = np.asarray(
+                    DataPipeline.drop_duplicate_assembly_copies(
+                        bioassembly_dict=bioassembly_dict,
+                        selected_indices=np.arange(_n_tok),
+                        ref_chain_indices=_refs,
+                    )
+                )
+                if _kept.size < _n_tok:
+                    selected_indices = torch.as_tensor(_kept, dtype=torch.long)
             # Prepare msa
             msa_features = DataPipeline.get_msa_raw_features(
                 bioassembly_dict=bioassembly_dict,
@@ -439,10 +458,35 @@ class DataPipeline(object):
                 selected_indices=selected_indices,
                 template_featurizer=template_featurizer,
             )
+            if selected_indices is None:
+                return (
+                    "no_crop",
+                    bioassembly_dict["token_array"],
+                    bioassembly_dict["atom_array"],
+                    msa_features or {},
+                    template_features or {},
+                    -1,
+                )
+            # Duplicates were removed: materialise the reduced arrays through the
+            # same path the cropper uses, so token/atom bookkeeping stays consistent.
+            dedup_crop = CropData(
+                crop_size=len(bioassembly_dict["token_array"]),
+                ref_chain_indices=_refs,
+                token_array=bioassembly_dict["token_array"],
+                atom_array=bioassembly_dict["atom_array"],
+                method_weights=method_weights,
+                contiguous_crop_complete_lig=contiguous_crop_complete_lig,
+                spatial_crop_complete_lig=spatial_crop_complete_lig,
+                drop_last=drop_last,
+                remove_metal=remove_metal,
+            )
+            dedup_token_array, dedup_atom_array = dedup_crop.crop_by_indices(
+                selected_token_indices=selected_indices,
+            )
             return (
-                "no_crop",
-                bioassembly_dict["token_array"],
-                bioassembly_dict["atom_array"],
+                "no_crop_dedup",
+                dedup_token_array,
+                dedup_atom_array,
                 msa_features or {},
                 template_features or {},
                 -1,
