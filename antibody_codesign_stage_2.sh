@@ -35,10 +35,10 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --enable_tf32 true \
 --project protenix \
 --use_wandb true \
---diffusion_batch_size 4 \
+--diffusion_batch_size 1 \
 --eval_interval 12000 \
 --log_interval 50 \
---checkpoint_interval 400 \
+--checkpoint_interval 5000 \
 --ema_decay 0.999 \
 --eval_ema_only true \
 --test_max_n_token 2048 \
