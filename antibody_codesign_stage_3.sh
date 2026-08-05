@@ -36,14 +36,14 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --project protenix \
 --use_wandb true \
 --diffusion_batch_size 8 \
---eval_interval 5000 \
+--eval_interval 10000 \
 --log_interval 50 \
 --checkpoint_interval 400 \
 --ema_decay 0.999 \
 --eval_ema_only true \
 --test_max_n_token 2048 \
 --train_crop_size 512 \
---max_steps 100000 \
+--max_steps 21000 \
 --warmup_steps 2000 \
 --lr 0.0002 \
 --model.N_cycle 4 \

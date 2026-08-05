@@ -25,7 +25,8 @@ export CUDA_VISIBLE_DEVICES=0,1
 # Specify your data root directory by uncommenting the following line.
 export PROTENIX_ROOT_DIR="/home/dinge/data/proj/protenix_codesign/data"
 # wget -P $PROTENIX_ROOT_DIR/checkpoint/ https://protenix.tos-cn-beijing.volces.com/checkpoint/protenix_base_default_v1.0.0.pt
-checkpoint_path="${PROTENIX_ROOT_DIR}/checkpoint/protenix_base_default_v1.0.0.pt"
+#checkpoint_path="${PROTENIX_ROOT_DIR}/checkpoint/protenix_base_default_v1.0.0.pt"
+checkpoint_path="/home/dinge/Protenix/output/protenix_antibody_codesign_stage_1_discrete_absorb_20260804_234544_up_to_step_5199/checkpoints/5199.pt"
 torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --model_name "protenix_base_default_v1.0.0_codesign" \
 --run_name protenix_antibody_codesign_stage_1_discrete_absorb \
@@ -36,14 +37,14 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --project protenix \
 --use_wandb true \
 --diffusion_batch_size 4 \
---eval_interval 5000 \
+--eval_interval 20000 \
 --eval_ema_only true \
 --test_max_n_token 2048 \
 --log_interval 50 \
 --checkpoint_interval 400 \
 --ema_decay 0.999 \
 --train_crop_size 256 \
---max_steps 100000 \
+--max_steps 120000 \
 --warmup_steps 2000 \
 --lr 0.0002 \
 --model.N_cycle 4 \
