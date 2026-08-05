@@ -35,7 +35,7 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --enable_tf32 true \
 --project protenix \
 --use_wandb true \
---diffusion_batch_size 4 \
+--diffusion_batch_size 1 \
 --eval_interval 5000 \
 --log_interval 50 \
 --checkpoint_interval 5000 \
@@ -43,8 +43,8 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --eval_ema_only true \
 --test_max_n_token 2048 \
 --train_crop_size 512 \
---max_steps 30000 \
---warmup_steps 2000 \
+--max_steps 20000 \
+--warmup_steps 200 \
 --lr 0.0002 \
 --model.N_cycle 4 \
 --model.diffusion_module.sequence_noise_type discrete_absorb \
