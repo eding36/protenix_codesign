@@ -25,28 +25,29 @@ export LAYERNORM_TYPE=torch
 # Specify your data root directory by uncommenting the following line.
 export PROTENIX_ROOT_DIR="/home/dinge/data/proj/protenix_codesign/data"
 # wget -P $PROTENIX_ROOT_DIR/checkpoint/ https://protenix.tos-cn-beijing.volces.com/checkpoint/protenix_base_default_v1.0.0.pt
-checkpoint_path="/home/dinge/Protenix/output/protenix_antibody_codesign_stage_2_angular_diffusion_20260730_111338/checkpoints/stage_2.pt"
+checkpoint_path="/home/dinge/Protenix/output/protenix_antibody_codesign_stage_4_discrete_absorb_20260730_111338/checkpoints/stage_4.pt"
 torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --model_name "protenix_base_default_v1.0.0_codesign" \
---run_name protenix_antibody_codesign_stage_3_angular_diffusion \
+--run_name protenix_antibody_codesign_stage_5_angular_diffusion \
 --seed 42 \
 --base_dir ./output \
 --dtype bf16 \
 --enable_tf32 true \
 --project protenix \
 --use_wandb true \
---diffusion_batch_size 32 \
+--diffusion_batch_size 4 \
 --eval_interval 5000 \
 --log_interval 50 \
---checkpoint_interval 400 \
+--checkpoint_interval 5000 \
 --ema_decay 0.999 \
 --eval_ema_only true \
 --test_max_n_token 2048 \
 --train_crop_size 512 \
---max_steps 100000 \
+--max_steps 30000 \
 --warmup_steps 2000 \
---lr 0.001 \
+--lr 0.0002 \
 --model.N_cycle 4 \
+--model.diffusion_module.sequence_noise_type discrete_absorb \
 --sample_diffusion.N_step 200 \
 --sample_diffusion.N_sample 1 \
 --triangle_attention "cuequivariance" \
@@ -58,8 +59,9 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --data.template.enable_prot_template false \
 --data.msa.enable_prot_msa true \
 --data.msa.enable_rna_msa false \
---loss.weight.alpha_sequence 2.0 \
+--loss.weight.alpha_sequence 1.0 \
 --antibody_add_antigen true \
 --antibody_min_neighborhood 0 \
 --antibody_max_neighborhood 40 \
---antibody_mixed_prob 0.0
+--antibody_mixed_prob 0.5 \
+--torsion_noise_prob 0.3

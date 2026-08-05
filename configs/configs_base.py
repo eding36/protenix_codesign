@@ -334,6 +334,9 @@ model_configs = {
         },
         "diffusion_module": {
             "use_fine_grained_checkpoint": True,
+            # Declared here so it registers as a CLI flag: train.py parses argv
+            # against the base configs before merging the model-type preset.
+            "sequence_noise_type": "discrete_uniform",
             "sigma_data": GlobalConfigValue("sigma_data"),
             "c_token": 768,
             "c_atom": GlobalConfigValue("c_atom"),
