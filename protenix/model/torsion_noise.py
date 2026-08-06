@@ -73,7 +73,7 @@ def build_torsion_index(
         )
 
     if bonds is None or len(bonds) == 0:
-        return []  # without connectivity we cannot build correct downstream sets
+        return []  # without connectivity information we cannot build correct downstream sets
     adjacency = _adjacency(bonds, n_atoms)
     # Per-atom residue index, so _downstream can reject subtrees that escape the
     # residue through a cross-link (disulfides) rather than walking the whole chain.
