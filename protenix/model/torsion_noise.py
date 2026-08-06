@@ -1,23 +1,18 @@
-"""Torsion-space (bond-length preserving) noising for structure diffusion.
+"""Torsion-space noising for structure diffusion.
 
-Isotropic Gaussian noise in Cartesian space destroys covalent geometry: bond
-lengths, bond angles and chirality are all violated, so a large share of the
-denoiser's capacity goes into restoring local geometry rather than modelling
-conformational change.
+Adding Gaussian noise to atom coordinates breaks the molecule: bonds stretch and
+angles distort, so the denoiser spends much of its capacity just rebuilding valid
+chemistry. This module instead noises a structure the way a real side chain moves
+-- by twisting it around its rotatable bonds.
 
-This module noises structures by **rotating about rotatable bonds** instead. A
-rotation of the downstream atom set about the axis through a bond changes only
-torsion angles: every bond length is preserved exactly (the moved substructure is
-rigid, and the one bond crossing the partition lies on the rotation axis), and
-every bond angle is preserved for the same reason. The output is still a
-coordinate tensor, so the rest of the diffusion pipeline is unchanged.
+Think of a bond as a hinge and the atoms beyond it as the door. Swinging the door
+changes where those atoms are without bending the door itself or moving the hinge:
+bond lengths and bond angles come through untouched, and only the twist angle
+about that bond changes. The result is still just coordinates, so nothing
+downstream needs to change.
 
-Scope: side-chain ``chi`` torsions of standard amino acids. Backbone ``phi``/``psi``
-are deliberately excluded -- rotating a backbone torsion moves the entire
-downstream chain, so the coordinate displacement per radian grows with the lever
-arm and is wildly non-uniform along the sequence. Callers combine this with
-ordinary Gaussian noise on the atoms this module does not move (see
-``TorsionNoiser.residual_mask``).
+Only side-chain torsions are used. Twisting a backbone bond would swing the entire
+rest of the chain, displacing distant atoms enormously for a small angle.
 """
 
 from typing import Optional
@@ -43,35 +38,25 @@ def build_torsion_index(
     n_atoms: int,
     bonds: Optional[np.ndarray] = None,
 ) -> "list[tuple[int, int, np.ndarray]]":
-    """Enumerate rotatable side-chain bonds and the atoms they move.
+    """Find every rotatable side-chain bond and the atoms it swings.
 
-    For a residue whose side chain is ``[CB, CG, CD, ...]`` (canonical order), the
-    bond ``(a_i, a_{i+1})`` is rotatable and moves ``a_{i+2:}``. ``chi1`` is the
-    CA-CB bond, which moves ``CG`` onward.
-
-    Candidates are then **validated against the real bond graph**: rotating the
-    downstream set is only bond-length preserving if every bond crossing the
-    partition has its stationary endpoint *on the rotation axis* (i.e. it is one of
-    the two pivots). This automatically rejects the cases where the canonical
-    linear ordering is not the true topology:
-
-    * proline -- the side chain rings back to the backbone N;
-    * tryptophan / histidine / phenylalanine ring closures inside the side chain;
-    * cystine -- a disulfide bonds the side chain to another residue.
-
-    Without ``bonds`` the validation is skipped and those residues will have their
-    rings torn open, so callers should always pass the connectivity.
+    A side chain is a short arm of atoms, so every bond along it is a candidate
+    hinge. Some cannot actually swing: a bond inside a ring (proline, the
+    aromatics) is like a hinge welded into a closed loop, and a cysteine joined to
+    a partner by a disulfide is chained to the wall. Both are detected from the
+    structure's real connectivity and dropped -- which is why ``bonds`` is
+    required.
 
     Args:
         atom_names / res_names: ``[N_atom]`` per-atom metadata.
         residue_starts: residue boundaries with an exclusive stop.
         n_atoms: total atom count.
-        bonds: ``[N_bond, 2]`` atom-index pairs used to validate each candidate.
+        bonds: ``[N_bond, 2]`` atom-index pairs.
 
     Returns:
-        List of ``(pivot_a, pivot_b, moved_indices, depth)``: rotate ``moved_indices``
-        about the axis through atoms ``pivot_a -> pivot_b``. ``depth`` is the chi
-        level, used to batch independent rotations.
+        One entry per usable torsion: the two atoms defining the rotation axis, the
+        atoms that swing with it, and its depth (chi1, chi2, ...). Torsions at the
+        same depth never overlap, so they can all be rotated together.
     """
     torsions = []
     candidates: "list[tuple[int, int, int]]" = []
@@ -94,8 +79,13 @@ def build_torsion_index(
     if bonds is None or len(bonds) == 0:
         return []  # without connectivity we cannot build correct downstream sets
     adjacency = _adjacency(bonds, n_atoms)
+    # Per-atom residue index, so _downstream can reject subtrees that escape the
+    # residue through a cross-link (disulfides) rather than walking the whole chain.
+    atom_residue = np.zeros(n_atoms, dtype=np.int64)
+    for r in range(len(residue_starts) - 1):
+        atom_residue[residue_starts[r] : residue_starts[r + 1]] = r
     for a, b, depth in candidates:
-        moved = _downstream(a, b, adjacency)
+        moved = _downstream(a, b, adjacency, atom_residue, int(atom_residue[a]))
         if moved is not None and moved.size:
             torsions.append((a, b, moved, depth))
     return torsions
@@ -107,11 +97,10 @@ def torsion_index_to_tensors(
     """Flatten a torsion index into padding-free tensors for the feature dict.
 
     Returns:
-        torsion_pivot   [T, 2]  the two axis atoms of each torsion
-        torsion_depth   [T]     chi level (0 = chi1); torsions at the same depth
-            touch disjoint atom sets, so a whole depth can be rotated at once.
+        torsion_pivot   [T, 2]  axis atoms of each torsion
+        torsion_depth   [T]     chi level (0 = chi1)
         torsion_atom    [K]     atom indices moved by some torsion
-        torsion_atom_id [K]     which torsion each entry in ``torsion_atom`` belongs to
+        torsion_atom_id [K]     which torsion each ``torsion_atom`` entry belongs to
     """
     if not torsions:
         return {
@@ -143,12 +132,12 @@ def apply_torsion_noise(
     sigma: torch.Tensor,
     max_angle: float = float(np.pi),
 ) -> torch.Tensor:
-    """Vectorised torsion-space noising of a coordinate tensor.
+    """Twist every torsion by a random angle scaled to ``sigma``.
 
-    Torsions sharing a depth act on disjoint atom sets, so each depth is applied in
-    one batched rotation; only the (at most four) chi levels are sequential, rather
-    than every torsion. Nested torsions therefore compose correctly -- chi2 rotates
-    about the axis chi1 has already moved.
+    Hinges are nested like joints in an arm: the shoulder moves the elbow, so
+    rotations are applied one level at a time (chi1, then chi2, ...) and each level
+    twists about an axis the previous one has already repositioned. Within a level
+    the joints are independent, so they all turn at once.
 
     Args:
         coords: ``[..., N_atom, 3]``
@@ -202,19 +191,26 @@ def _adjacency(bonds: np.ndarray, n_atoms: int) -> "list[list[int]]":
 
 
 def _downstream(
-    a: int, b: int, adjacency: "list[list[int]]"
+    a: int,
+    b: int,
+    adjacency: "list[list[int]]",
+    atom_residue: Optional[np.ndarray] = None,
+    residue: Optional[int] = None,
 ) -> Optional[np.ndarray]:
-    """Atoms reachable from ``b`` without crossing back through ``a``.
+    """The atoms that swing when the ``a-b`` bond is twisted.
 
-    This is the true torsion subtree, so rotating it about the ``a -> b`` axis
-    changes only the torsion: every bond length *and* every bond angle is
-    preserved, because each moved atom keeps its distance to the axis and the only
-    stationary neighbours of the moved set are the pivots themselves.
+    Starting at ``b`` and never stepping back through ``a``, this collects
+    everything on the far side of the hinge. Returns ``None`` when the bond cannot
+    swing after all:
 
-    Returns ``None`` when ``a`` is reachable from ``b`` without using the ``a-b``
-    bond -- that means the bond lies in a ring (proline's N-CD closure, aromatic
-    side chains, a disulfide bridged through the backbone) and cannot be rotated
-    without tearing the ring open.
+    * the walk loops back around to ``a`` -- the bond is part of a ring, so turning
+      it would be like forcing a hinge set into a closed picture frame;
+    * the walk wanders out of the residue -- a cysteine tethered to a partner by a
+      disulfide, so swinging it would drag the other residue across the structure
+      rather than moving a free side chain.
+
+    Only the first case loops back, so the second has to be caught by checking that
+    the walk stays inside its own residue.
     """
     seen = {b}
     stack = [b]
@@ -226,6 +222,8 @@ def _downstream(
             if nxt == a:
                 return None  # cycle back to the pivot -> ring bond, not rotatable
             if nxt not in seen:
+                if atom_residue is not None and atom_residue[nxt] != residue:
+                    return None  # cross-link out of the residue (disulfide)
                 seen.add(nxt)
                 stack.append(nxt)
     seen.discard(b)
