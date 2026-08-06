@@ -570,6 +570,21 @@ class AF3Trainer(object):
             if is_ca.shape[0] != n_atom:
                 return
 
+            # Chi-angle error: the only metric here that says whether the model
+            # learned side-chain TORSIONS. mse_loss is Cartesian (a correctly
+            # shaped side chain rotated as a whole scores as badly as a mangled
+            # one) and bond_loss measures covalent-geometry violation, which
+            # torsion noising preserves by construction. Reported overall and for
+            # the CDR subset; averaged across complexes by the metric aggregator.
+            try:
+                from protenix.metrics.chi_angles import chi_angle_errors
+
+                simple_metrics.update(
+                    chi_angle_errors(atom_array, all_p, g, region)
+                )
+            except Exception as e:  # noqa: BLE001 - diagnostic only, never break eval
+                logging.debug("chi-angle metric skipped: %s", e)
+
             # No RMSD is computed here. Benchmark 2 is a separate offline step:
             # this pass only writes every predicted structure (already conditioned by
             # replacement sampling) plus the region metadata, and
