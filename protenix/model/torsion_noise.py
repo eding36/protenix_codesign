@@ -2,17 +2,14 @@
 
 Adding Gaussian noise to atom coordinates breaks the molecule: bonds stretch and
 angles distort, so the denoiser spends much of its capacity just rebuilding valid
-chemistry. This module instead noises a structure the way a real side chain moves
--- by twisting it around its rotatable bonds.
+chemistry. This module instead noises a structure the way a real side chain moves, 
+by twisting it around its rotatable bonds.
 
-Think of a bond as a hinge and the atoms beyond it as the door. Swinging the door
-changes where those atoms are without bending the door itself or moving the hinge:
-bond lengths and bond angles come through untouched, and only the twist angle
-about that bond changes. The result is still just coordinates, so nothing
-downstream needs to change.
+Bond lengths and angles don't change, so the noised structure is still physically viable.
+Applying torsion noise still returns noised coordinates, so nothing downstream needs to change.
 
-Only side-chain torsions are used. Twisting a backbone bond would swing the entire
-rest of the chain, displacing distant atoms enormously for a small angle.
+Only side-chain torsions are applied. Twisting a backbone bond would move the entire
+rest of the chain, displacing distant atoms tremendously for a small angular change.
 """
 
 from typing import Optional
@@ -38,18 +35,17 @@ def build_torsion_index(
     n_atoms: int,
     bonds: Optional[np.ndarray] = None,
 ) -> "list[tuple[int, int, np.ndarray]]":
-    """Find every rotatable side-chain bond and the atoms it swings.
+    """Finds every rotatable side-chain bond, along with the specific atoms it moves in 3D space when rotated.
 
     A side chain is a short arm of atoms, so every bond along it is a candidate
-    hinge. Some cannot actually swing: a bond inside a ring (proline, the
-    aromatics) is like a hinge welded into a closed loop, and a cysteine joined to
-    a partner by a disulfide is chained to the wall. Both are detected from the
-    structure's real connectivity and dropped -- which is why ``bonds`` is
+    rotatable side chain bond. Disulfide bridges, prolines, and aromatics are exceptions that cannot
+    actually rotate their bonds so they are excluded. Both are detected from the
+    structure's real connectivity and dropped which is why ``bonds`` is
     required.
 
     Args:
         atom_names / res_names: ``[N_atom]`` per-atom metadata.
-        residue_starts: residue boundaries with an exclusive stop.
+        residue_starts: determins which atom indices make up a certain residue indice.
         n_atoms: total atom count.
         bonds: ``[N_bond, 2]`` atom-index pairs.
 
