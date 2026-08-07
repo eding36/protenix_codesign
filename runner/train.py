@@ -580,7 +580,7 @@ class AF3Trainer(object):
                 from protenix.metrics.chi_angles import chi_angle_errors
 
                 simple_metrics.update(
-                    chi_angle_errors(atom_array, all_p, g, region)
+                    chi_angle_errors(atom_array, all_p, g, region, resolved)
                 )
             except Exception as e:  # noqa: BLE001 - diagnostic only, never break eval
                 logging.debug("chi-angle metric skipped: %s", e)

@@ -64,6 +64,7 @@ def chi_angle_errors(
     pred_coord: torch.Tensor,
     gt_coord: torch.Tensor,
     region_per_atom: Optional[torch.Tensor] = None,
+    resolved: Optional[torch.Tensor] = None,
 ) -> "dict[str, float]":
     """Mean |chi error| between predicted and ground-truth side chains.
 
@@ -73,12 +74,22 @@ def chi_angle_errors(
         gt_coord: ``[..., N_atom, 3]``.
         region_per_atom: optional ``[N_atom]`` Chothia region id, used to report
             the CDR-only subset separately.
+        resolved: optional ``[N_atom]`` bool from ``coordinate_mask``. REQUIRED for
+            a meaningful number: the parser zeroes unresolved coordinates
+            (parser.py: ``coord[~is_resolved] = 0``), so a quad touching one is a
+            dihedral about the origin -- pure noise. On this test set 36% of quads
+            are like that, enough to dominate the mean if left in.
 
     Returns:
         ``chi/mae``, ``chi/chi{1..4}``, ``chi/frac_below_30`` and, when regions are
         given, the same under ``chi/cdr_*``. Empty when no chi is measurable (all
         side chains stripped or unresolved).
     """
+    if resolved is not None:
+        res_np = np.asarray(resolved.detach().cpu()).astype(bool).reshape(-1)
+    else:
+        res_np = None
+
     names = np.asarray(atom_array.atom_name)
     resn = np.asarray(atom_array.res_name)
     resi = np.asarray(atom_array.res_id)
@@ -98,6 +109,8 @@ def chi_angle_errors(
             if any(a not in amap for a in atoms):
                 continue  # stripped or unresolved side chain
             idx = [amap[a] for a in atoms]
+            if res_np is not None and not all(res_np[i] for i in idx):
+                continue  # some atom sits at the origin -> meaningless dihedral
             quads.append(idx)
             chi_idx.append(ci)
             # Bucket by the region of the atom the torsion pivots on.
