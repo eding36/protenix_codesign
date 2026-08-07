@@ -1822,10 +1822,13 @@ class ProtenixLoss(nn.Module):
             if pred_dict.get("sequence", None) is not None:
                 # discrete_absorb masks with the sampled seq_mask; discrete_uniform
                 # (and default) uses the static CDR design mask.
+                # seq_mask exists only on the training path; eval seeds every CDR
+                # position masked, so the design region there is the whole cdr_mask.
                 noise_type = self.configs.model.diffusion_module.sequence_noise_type
                 seq_mask = (
                     feat_dict["seq_mask"]
                     if noise_type == "discrete_absorb"
+                    and feat_dict.get("seq_mask") is not None
                     else feat_dict["cdr_mask"]
                 )
                 loss_fns.update(
