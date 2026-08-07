@@ -21,6 +21,9 @@ from protenix.data.constants import ATOM14
 
 BACKBONE_ATOMS = ("N", "CA", "C", "O")
 
+# Angle (radians) per Angstrom of sigma, per unit lever arm. See apply_torsion_noise.
+THETA_PER_SIGMA = 2.0
+
 # Side-chain atoms in canonical (proximal -> distal) order per residue.
 SC_ORDER = {
     res: tuple(a for a in atoms if a not in BACKBONE_ATOMS)
@@ -192,12 +195,40 @@ def apply_torsion_noise(
         return coords
     out = coords.clone()
     n_torsion = torsion_pivot.shape[0]
-    # sigma (A) -> angular scale: a moved atom sits ~2 A from its axis, so a
-    # rotation of theta displaces it by ~2*theta.
-    theta_scale = (sigma / 2.0).clamp(max=max_angle)
+
+    # sigma (A) -> angular scale, per torsion.
+    #
+    # An atom r away from the axis moves 2*r*sin(theta/2) when the bond turns by
+    # theta, so the angle a given sigma calls for depends on that torsion's lever
+    # arm -- which spans ~1.1 to ~2.7 A across a side chain, too wide to replace
+    # with one constant. r is measured here from the CURRENT coordinates.
+    #
+    # THETA_PER_SIGMA is calibrated so the median torsion displacement matches the
+    # median Gaussian displacement over the sigma range this is actually used in.
+    # The analytic value (1.5382/0.6745 = 2.28, from the medians of a 3-D Gaussian
+    # length and of |N(0,s)|) overshoots by ~15% because it ignores the spread of
+    # lever arms within one torsion; 2.0 measured best across four structures.
+    # (The old flat sigma/2 under-rotated by ~3x.)
+    pa0 = coords[..., torsion_pivot[:, 0], :]
+    pb0 = coords[..., torsion_pivot[:, 1], :]
+    ax0 = pb0 - pa0
+    ax0 = ax0 / ax0.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    rel = coords[..., torsion_atom, :] - pb0[..., torsion_atom_id, :]
+    perp = rel - (rel * ax0[..., torsion_atom_id, :]).sum(-1, keepdim=True) * ax0[
+        ..., torsion_atom_id, :
+    ]
+    # RMS lever arm per torsion, via scatter-mean of r^2 over that torsion's atoms.
+    r2 = perp.pow(2).sum(-1)  # [..., K]
+    sums = torch.zeros(
+        (*r2.shape[:-1], n_torsion), device=coords.device, dtype=coords.dtype
+    ).index_add_(-1, torsion_atom_id, r2)
+    cnts = torch.bincount(torsion_atom_id, minlength=n_torsion).to(coords.dtype)
+    lever = (sums / cnts.clamp(min=1.0)).sqrt().clamp(min=0.3)  # [..., n_torsion]
+
+    theta_scale = (THETA_PER_SIGMA * sigma[..., None] / lever).clamp(max=max_angle)
     angles = torch.randn(
-        (*theta_scale.shape, n_torsion), device=coords.device, dtype=coords.dtype
-    ) * theta_scale[..., None] #randomly sample rotational angles
+        theta_scale.shape, device=coords.device, dtype=coords.dtype
+    ) * theta_scale  # randomly sample rotational angles
 
     for depth in torsion_depth.unique(sorted=True): #iterate up to max torsional depth (residue with max # of chi angles)
         at_depth = torsion_depth == depth #at_depth is a boolean array that labels which chi angles for each residue should change at the current depth. 

@@ -351,6 +351,7 @@ class DiffusionModule(nn.Module):
         sequence_noise_type: str = "discrete_uniform",
         N_steps_seq: int = 200,
         torsion_noise_prob: float = 0.0,
+        torsion_sigma_max: float = 2.0,
     ) -> None:
         super(DiffusionModule, self).__init__()
         self.sigma_data = sigma_data
@@ -384,6 +385,8 @@ class DiffusionModule(nn.Module):
         # Probability a training step uses bond-length-preserving torsion noising
         # instead of EDM Gaussian noise (see protenix/model/torsion_noise.py).
         self.torsion_noise_prob = torsion_noise_prob
+        # Torsion noising is only applied at or below this sigma; see configs_base.
+        self.torsion_sigma_max = torsion_sigma_max
         self.N_steps_seq = N_steps_seq
         if sequence_train:
             if sequence_model_args is None:

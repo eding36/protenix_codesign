@@ -38,6 +38,8 @@ basic_configs = {
     # 0.0 = pure EDM (original behaviour), 1.0 = always torsion. Mixing keeps the
     # model competent on both noise distributions.
     "torsion_noise_prob": 0.0,
+    "torsion_sigma_max": 2.0,  # Torsion noising only fires when the step's sigma is at or below this (Angstrom).
+    
     # Replacement sampling at eval (MFDesign Alg. S3): pin the native framework /
     # antigen and generate only the CDRs, conditioning the design on the given
     # co-crystal structure. Off by default -- it changes what the metrics mean.

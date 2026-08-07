@@ -101,6 +101,7 @@ model_configs = {
                 # Share the top-level torsion/EDM mixing probability so it can be
                 # set per model as well as from the training CLI.
                 "torsion_noise_prob": GlobalConfigValue("torsion_noise_prob"),
+                "torsion_sigma_max": GlobalConfigValue("torsion_sigma_max"),
                 "sequence_model_args": {
                     "hidden_dim": 768,
                     "vocab_size": 20,

@@ -901,6 +901,7 @@ class Protenix(nn.Module):
             noise_type = self.seq_noise_type,
             n_steps_seq = self.n_steps_seq,
             torsion_noise_prob = self.diffusion_module.torsion_noise_prob,
+            torsion_sigma_max = self.diffusion_module.torsion_sigma_max,
             seq_sigma_schedule = self.seq_sigma_schedule
         )
         pred_dict.update(

@@ -649,6 +649,7 @@ def sample_diffusion_training(
     n_steps_seq: int = 200,
     seq_sigma_schedule: Optional[torch.Tensor] = None,
     torsion_noise_prob: float = 0.0,
+    torsion_sigma_max: float = 2.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Implements diffusion training as described in AF3 Appendix at page 23.
     It performances denoising steps from time 0 to time T.
@@ -730,9 +731,17 @@ def sample_diffusion_training(
     # To prevent model dependence on torsional noise, backbone torsions are excluded because their
     # lever arm makes displacement-per-radian wildly non-uniform). Atoms no torsion
     # reaches keep the ordinary Gaussian noise so the structure is fully noised.
+    # A rotation moves an atom at most 2r, the diameter of the circle it traces about
+    # its axis. Side-chain lever arms are ~1.5 A, so torsion displacement is capped
+    # near 2 A whatever angle is drawn -- it CANNOT represent the corruption a large
+    # sigma implies. Applying it there would label a nearly clean structure as
+    # maximally noised, and EDM's preconditioning and loss weight are both functions
+    # of sigma. So restrict it to the low-sigma refinement regime and let everything
+    # above fall through to Gaussian.
     x_noisy_override = None
     if (
         torsion_noise_prob > 0.0
+        and float(sigma.max()) <= torsion_sigma_max
         and random.random() < torsion_noise_prob
         and input_feature_dict.get("torsion_pivot") is not None
         and input_feature_dict["torsion_pivot"].numel() > 0

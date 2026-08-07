@@ -175,6 +175,39 @@ class AF3Trainer(object):
                 "https://www.deepspeed.ai/tutorials/ds4sci_evoformerattention/"
             )
         logging.info("Finished environment initialization.")
+        self._log_torsion_noise_rate()
+
+    def _log_torsion_noise_rate(self) -> None:
+        """Report the MARGINAL torsion-noise rate, not just the configured one.
+
+        torsion_noise_prob is conditional on sigma <= torsion_sigma_max, so the
+        fraction of steps that actually use torsion noise is the product of the two.
+        Printing only the configured probability invites reading 0.4 as "40% of
+        steps" when the real figure can be a third of that.
+        """
+        prob = getattr(self.configs, "torsion_noise_prob", 0.0)
+        if not prob:
+            return
+        smax = getattr(self.configs, "torsion_sigma_max", 0.0)
+        try:
+            import math
+
+            sd = self.configs.model.diffusion_module.sigma_data
+            dm = self.configs.loss.diffusion.mse
+            p_mean = getattr(dm, "p_mean", -1.2)
+            p_std = getattr(dm, "p_std", 1.5)
+            # sigma is log-normal: P(sigma <= s) = Phi((ln(s/sigma_data) - mu) / std)
+            z = (math.log(smax / sd) - p_mean) / p_std
+            frac = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+            logging.info(
+                "torsion noise: p=%.2f conditional on sigma<=%.2f A "
+                "(P(sigma<=%.2f)=%.1f%%) -> %.1f%% of steps use torsion noise",
+                prob, smax, smax, 100 * frac, 100 * prob * frac,
+            )
+        except Exception:  # noqa: BLE001 - diagnostic only
+            logging.info(
+                "torsion noise: p=%.2f conditional on sigma<=%.2f A", prob, smax
+            )
 
     def init_loss(self) -> None:
         """
