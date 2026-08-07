@@ -727,10 +727,7 @@ def sample_diffusion_training(
     # instead of displacing those atoms with iid Gaussian noise, so bond lengths,
     # bond angles and chirality of the moved substructures stay exact and the
     # denoiser does not spend capacity restoring local covalent geometry.
-    # The decision is per training step, so the model sees both noise
-    # distributions and never becomes dependent on either.
-    # NOTE: only atoms downstream of a rotatable bond can move this way (~30% of a
-    # typical antibody complex -- backbone torsions are excluded because their
+    # To prevent model dependence on torsional noise, backbone torsions are excluded because their
     # lever arm makes displacement-per-radian wildly non-uniform). Atoms no torsion
     # reaches keep the ordinary Gaussian noise so the structure is fully noised.
     x_noisy_override = None
