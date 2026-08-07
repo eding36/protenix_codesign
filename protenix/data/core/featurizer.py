@@ -748,7 +748,64 @@ class Featurizer(object):
         features.update(mask_features)
 
         features.update(self.get_torsion_features())
+        features.update(self.get_chi_features())
         return features
+
+    def get_chi_features(self) -> dict[str, torch.Tensor]:
+        """Atom quadruples defining each side-chain chi torsion, for the chi loss.
+
+        Pure topology (which four atoms define which dihedral), so it carries no
+        coordinate information and is safe as a model input. Built here because the
+        loss only ever sees tensors, not the AtomArray.
+
+        ``chi_periodic`` marks the torsions whose two terminal atoms are chemically
+        indistinguishable (Asp chi2, Glu chi3, Phe/Tyr chi2). A 180-degree flip of
+        those produces the SAME physical side chain, so the loss must not penalise
+        it -- see ChiLoss.
+
+        Empty tensors when nothing is measurable, which makes the loss a no-op.
+        """
+        from protenix.data.constants import _CHI_ANGLES_ATOMS
+
+        # (residue, 0-based chi index) whose terminal atoms are interchangeable.
+        pi_periodic = {("ASP", 1), ("GLU", 2), ("PHE", 1), ("TYR", 1)}
+
+        atom_array = self.cropped_atom_array
+        n_atoms = len(atom_array)
+        if n_atoms == 0:
+            return {
+                "chi_atom_index": torch.zeros((0, 4), dtype=torch.long),
+                "chi_periodic": torch.zeros((0,), dtype=torch.bool),
+            }
+
+        names = np.asarray(atom_array.atom_name)
+        resn = np.asarray(atom_array.res_name)
+        residue_starts = get_residue_starts(atom_array, add_exclusive_stop=True)
+
+        quads: list[list[int]] = []
+        periodic: list[bool] = []
+        for r in range(len(residue_starts) - 1):
+            start, stop = residue_starts[r], residue_starts[r + 1]
+            rn = str(resn[start])
+            chis = _CHI_ANGLES_ATOMS.get(rn)
+            if not chis:
+                continue
+            idx_of = {str(nm): start + k for k, nm in enumerate(names[start:stop])}
+            for ci, atoms in enumerate(chis):
+                if any(a not in idx_of for a in atoms):
+                    continue  # stripped (CDR) or unresolved side chain
+                quads.append([idx_of[a] for a in atoms])
+                periodic.append((rn, ci) in pi_periodic)
+
+        if not quads:
+            return {
+                "chi_atom_index": torch.zeros((0, 4), dtype=torch.long),
+                "chi_periodic": torch.zeros((0,), dtype=torch.bool),
+            }
+        return {
+            "chi_atom_index": torch.tensor(quads, dtype=torch.long),
+            "chi_periodic": torch.tensor(periodic, dtype=torch.bool),
+        }
 
     def get_torsion_features(self) -> dict[str, torch.Tensor]:
         """Rotatable-torsion index for bond-length-preserving (torsion) noising.

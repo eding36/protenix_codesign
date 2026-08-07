@@ -1060,6 +1060,114 @@ class ExperimentallyResolvedLoss(nn.Module):
         return loss_reduction(loss, method=self.reduction)
 
 
+def _dihedral_cos_sin(
+    p: torch.Tensor, eps: float = 1e-8
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """cos and sin of the dihedral defined by 4 points. ``p``: ``[..., 4, 3]``.
+
+    Returns the angle as a (cos, sin) pair rather than the angle itself: it keeps
+    everything differentiable without atan2, whose gradient is 1/(x^2+y^2) and
+    blows up on the near-collinear atoms that a noisy structure is full of. Here
+    the projections are normalised first, so x^2+y^2 == 1 by construction.
+    """
+    b0 = p[..., 0, :] - p[..., 1, :]
+    b1 = p[..., 2, :] - p[..., 1, :]
+    b2 = p[..., 3, :] - p[..., 2, :]
+    b1 = b1 / b1.norm(dim=-1, keepdim=True).clamp(min=eps)
+    # Components of b0 and b2 perpendicular to the central bond.
+    v = b0 - (b0 * b1).sum(dim=-1, keepdim=True) * b1
+    w = b2 - (b2 * b1).sum(dim=-1, keepdim=True) * b1
+    v = v / v.norm(dim=-1, keepdim=True).clamp(min=eps)
+    w = w / w.norm(dim=-1, keepdim=True).clamp(min=eps)
+    cos = (v * w).sum(dim=-1)
+    sin = (torch.cross(b1, v, dim=-1) * w).sum(dim=-1)
+    return cos, sin
+
+
+class ChiLoss(nn.Module):
+    """Angular error on side-chain chi torsions.
+
+    Cartesian MSE already punishes a misplaced side chain, but not in proportion
+    to how wrong its CONFORMATION is: it is dominated by distal atoms, and a side
+    chain of perfect internal geometry sitting at the wrong rotamer scores much
+    like a mangled one. This adds a term that depends only on the dihedrals, so
+    the signal is about rotamer choice and nothing else.
+
+    Being an internal coordinate, chi is invariant to global rotation and
+    translation -- so unlike MSELoss this needs no alignment step.
+
+    The per-torsion penalty is ``1 - cos(pred - true)``: zero when the dihedrals
+    agree, 2 when they are opposed, smooth and periodic everywhere (no wraparound
+    discontinuity at +-180 degrees). For torsions whose terminal atoms are
+    interchangeable, ``1 - |cos|`` instead, so that a 180-degree flip -- the same
+    physical side chain -- costs nothing.
+    """
+
+    def __init__(self, eps: float = 1e-8, reduction: str = "mean") -> None:
+        super(ChiLoss, self).__init__()
+        self.eps = eps
+        self.reduction = reduction
+
+    def forward(
+        self,
+        pred_coordinate: torch.Tensor,
+        true_coordinate: torch.Tensor,
+        coordinate_mask: torch.Tensor,
+        chi_atom_index: torch.Tensor,
+        chi_periodic: torch.Tensor,
+        per_sample_scale: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """ChiLoss
+
+        Args:
+            pred_coordinate (torch.Tensor): denoised coordinates from the diffusion
+                module. [..., N_sample, N_atom, 3]
+            true_coordinate (torch.Tensor): ground truth coordinates. [..., N_atom, 3]
+            coordinate_mask (torch.Tensor): whether true coordinates exist.
+                [N_atom] or [..., N_atom]
+            chi_atom_index (torch.Tensor): atom quadruples per chi. [N_chi, 4]
+            chi_periodic (torch.Tensor): terminal atoms interchangeable. [N_chi]
+            per_sample_scale (torch.Tensor, optional): per-sample noise-level scale,
+                as used by the other diffusion losses. [..., N_sample]
+
+        Returns:
+            torch.Tensor: [...] if self.reduction is None else []
+        """
+        idx = chi_atom_index
+        if idx.numel() == 0:
+            return true_coordinate.new_zeros(())
+
+        # A chi counts only if all four of its atoms have true coordinates. The
+        # parser parks unresolved atoms at the origin, so an unmasked quad would
+        # be a dihedral about (0,0,0) -- pure noise.
+        mask = coordinate_mask[..., idx].all(dim=-1)  # [..., N_chi]
+
+        pred_cos, pred_sin = _dihedral_cos_sin(
+            pred_coordinate[..., idx, :], eps=self.eps
+        )  # [..., N_sample, N_chi]
+        true_cos, true_sin = _dihedral_cos_sin(
+            true_coordinate[..., idx, :], eps=self.eps
+        )  # [..., N_chi]
+
+        # cos(pred - true), expanded so no atan2 is needed.
+        cos_delta = pred_cos * true_cos.unsqueeze(-2) + pred_sin * true_sin.unsqueeze(
+            -2
+        )  # [..., N_sample, N_chi]
+        per_chi = torch.where(
+            chi_periodic, 1.0 - cos_delta.abs(), 1.0 - cos_delta
+        )  # [..., N_sample, N_chi]
+
+        mask = mask.unsqueeze(-2).to(per_chi.dtype)  # [..., 1, N_chi]
+        per_sample = (per_chi * mask).sum(dim=-1) / (
+            mask.sum(dim=-1) + self.eps
+        )  # [..., N_sample]
+
+        if per_sample_scale is not None:
+            per_sample = per_sample * per_sample_scale
+
+        return loss_reduction(per_sample.mean(dim=-1), method=self.reduction)
+
+
 class MSELoss(nn.Module):
     """
     Implements Formula 2-4 [MSELoss] in AF3
@@ -1536,6 +1644,8 @@ class ProtenixLoss(nn.Module):
         self.alpha_bond = self.configs.loss.weight.alpha_bond
         self.weight_smooth_lddt = self.configs.loss.weight.smooth_lddt
         self.alpha_sequence = self.configs.loss.weight.alpha_sequence
+        # 0.0 keeps this off; the term only exists on the angular-diffusion branch.
+        self.alpha_chi = getattr(self.configs.loss.weight, "alpha_chi", 0.0)
         self.sequence_train = self.configs.model.diffusion_module.sequence_train
 
         self.lddt_radius = {
@@ -1558,6 +1668,8 @@ class ProtenixLoss(nn.Module):
             "distogram_loss": self.alpha_distogram,
             # antibody codesign sequence CE
             "sequence_loss": self.alpha_sequence,
+            # side-chain chi torsion error (angular diffusion)
+            "chi_loss": self.alpha_diffusion * self.alpha_chi,
         }
 
         # Loss
@@ -1570,6 +1682,7 @@ class ProtenixLoss(nn.Module):
         self.smooth_lddt_loss = SmoothLDDTLoss(**configs.loss.diffusion.smooth_lddt)
         self.distogram_loss = DistogramLoss(**configs.loss.distogram)
         self.sequence_loss = SequenceLoss()
+        self.chi_loss = ChiLoss()
 
     def calculate_label(
         self,
@@ -1804,6 +1917,21 @@ class ProtenixLoss(nn.Module):
                     ),
                 }
             )
+            # Chi torsion loss (angular diffusion). Skipped entirely when the
+            # weight is 0 so the default branch pays nothing for it.
+            if self.alpha_chi != 0.0 and feat_dict.get("chi_atom_index") is not None:
+                loss_fns.update(
+                    {
+                        "chi_loss": lambda: self.chi_loss(
+                            pred_coordinate=pred_dict["coordinate"],
+                            true_coordinate=label_dict["coordinate"],
+                            coordinate_mask=label_dict["coordinate_mask"],
+                            chi_atom_index=feat_dict["chi_atom_index"],
+                            chi_periodic=feat_dict["chi_periodic"],
+                            per_sample_scale=diffusion_per_sample_scale,
+                        )
+                    }
+                )
             # Distogram Loss
             if "distogram" in pred_dict:
                 loss_fns.update(

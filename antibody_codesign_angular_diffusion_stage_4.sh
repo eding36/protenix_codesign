@@ -64,4 +64,5 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --antibody_min_neighborhood 0 \
 --antibody_max_neighborhood 40 \
 --antibody_mixed_prob 0.5 \
---torsion_noise_prob 0.4
+--torsion_noise_prob 0.4 \
+--loss.weight.alpha_chi 0.5

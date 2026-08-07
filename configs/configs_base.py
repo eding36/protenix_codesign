@@ -426,6 +426,9 @@ loss_configs = {
             "alpha_bond": 0.0,  # or 1 in finetuning stages
             "smooth_lddt": 1.0,  # or 0 in finetuning stages
             "alpha_sequence": 1.0,  # antibody codesign sequence CE loss
+            # Side-chain chi torsion loss (angular diffusion). 0 = off.
+            # Multiplied by alpha_diffusion, like mse/bond.
+            "alpha_chi": 0.0,
         },
         "plddt": {
             "min_bin": 0,
