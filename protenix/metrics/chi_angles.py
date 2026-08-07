@@ -21,6 +21,13 @@ preserves by construction, leaving it near zero whatever the model learned. This
 compares the dihedral itself.
 
 Errors are wrapped to [0, 180] degrees, so ~90 is what random guessing gives.
+
+Note on coverage: CDR side chains are stripped to backbone+CB during
+preprocessing (their atom count would otherwise reveal the residue identity the
+model is designing), so CDR positions have no chi to measure and ``chi/cdr_*``
+is normally empty. What is measured is framework and antigen -- reported
+separately, since the epitope side chains are the ones a CDR backbone packs
+against.
 """
 
 from typing import Optional
@@ -30,8 +37,12 @@ import torch
 
 from protenix.data.constants import _CHI_ANGLES_ATOMS
 
-# Chothia CDR region ids (protenix/data/antibody_cdr.py): cdr1/2/3 = 2/4/6.
-_CDR_REGIONS = (2, 4, 6)
+# Chothia region ids (protenix/data/antibody_cdr.py).
+_CDR_REGIONS = (2, 4, 6)          # cdr1/2/3 -- side chains are stripped, so these
+                                  # contribute no measurable chi (see module note)
+_FRAMEWORK_REGIONS = (1, 3, 5, 7)  # fr1..fr4
+_ANTIGEN_REGIONS = (8, 9)          # 8 = antigen, 9 = epitope
+_EPITOPE_REGIONS = (9,)
 
 
 def _dihedral(p: torch.Tensor) -> torch.Tensor:
@@ -80,7 +91,7 @@ def chi_angle_errors(
 
     quads: "list[list[int]]" = []
     chi_idx: "list[int]" = []
-    is_cdr: "list[bool]" = []
+    region_of: "list[int]" = []
     for key, amap in lookup.items():
         first = next(iter(amap.values()))
         for ci, atoms in enumerate(_CHI_ANGLES_ATOMS.get(str(resn[first]), [])):
@@ -89,10 +100,9 @@ def chi_angle_errors(
             idx = [amap[a] for a in atoms]
             quads.append(idx)
             chi_idx.append(ci)
-            is_cdr.append(
-                region_per_atom is not None
-                and int(region_per_atom[idx[2]]) in _CDR_REGIONS
-            )
+            # Bucket by the region of the atom the torsion pivots on.
+            reg = int(region_per_atom[idx[2]]) if region_per_atom is not None else -1
+            region_of.append(reg)
     if not quads:
         return {}
 
@@ -105,7 +115,10 @@ def chi_angle_errors(
     err = torch.where(err > 180.0, 360.0 - err, err).mean(dim=0)  # over samples
 
     ci = torch.as_tensor(chi_idx, device=err.device)
-    cdr = torch.as_tensor(is_cdr, device=err.device)
+    reg = torch.as_tensor(region_of, device=err.device)
+    in_ = lambda ids: torch.isin(reg, torch.as_tensor(ids, device=err.device))
+    cdr, fw = in_(_CDR_REGIONS), in_(_FRAMEWORK_REGIONS)
+    ag, ep = in_(_ANTIGEN_REGIONS), in_(_EPITOPE_REGIONS)
 
     def _summarise(mask: torch.Tensor, prefix: str) -> "dict[str, float]":
         if not bool(mask.any()):
@@ -123,5 +136,11 @@ def chi_angle_errors(
         return out
 
     metrics = _summarise(torch.ones_like(cdr, dtype=torch.bool), "chi/")
-    metrics.update(_summarise(cdr, "chi/cdr_"))
+    for mask, prefix in (
+        (cdr, "chi/cdr_"),
+        (fw, "chi/framework_"),
+        (ag, "chi/antigen_"),
+        (ep, "chi/epitope_"),
+    ):
+        metrics.update(_summarise(mask, prefix))
     return metrics
