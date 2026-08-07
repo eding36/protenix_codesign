@@ -26,6 +26,7 @@ SC_ORDER = {
     res: tuple(a for a in atoms if a not in BACKBONE_ATOMS)
     for res, atoms in ATOM14.items()
 }
+#e.g. {"ALA":("CB","CG",...all side chain atoms)}
 
 
 def build_torsion_index(
@@ -45,7 +46,7 @@ def build_torsion_index(
 
     Args:
         atom_names / res_names: ``[N_atom]`` per-atom metadata.
-        residue_starts: determins which atom indices make up a certain residue indice.
+        residue_starts: list of atom indices marking the start of a new residue. len(residue_starts) = # residues
         n_atoms: total atom count.
         bonds: ``[N_bond, 2]`` atom-index pairs.
 
@@ -56,21 +57,21 @@ def build_torsion_index(
     """
     torsions = []
     candidates: "list[tuple[int, int, int]]" = []
-    for r in range(len(residue_starts) - 1):
-        start, stop = residue_starts[r], residue_starts[r + 1]
-        order = SC_ORDER.get(res_names[start])
+    for r in range(len(residue_starts) - 1): 
+        start, stop = residue_starts[r], residue_starts[r + 1] #fetches all atom indices for that residue
+        order = SC_ORDER.get(res_names[start]) #get the side chain atom list for the selected residue
         if not order or len(order) < 2:
             continue  # Gly/Ala: nothing rotatable
-        names = list(atom_names[start:stop])
-        idx_of = {nm: start + k for k, nm in enumerate(names)}
+        names = list(atom_names[start:stop]) #[CA,CB,CG,CD]
+        idx_of = {nm: start + k for k, nm in enumerate(names)} #{CA:n, CB:n+1,...}
         if "CA" not in idx_of:
             continue
-        # Chain of pivots: (CA, CB), (CB, CG), (CG, CD), ...
-        chain = ["CA"] + [a for a in order if a in idx_of]
+        
+        chain = ["CA"] + [a for a in order if a in idx_of] #[CA,CB,CG,CD]
         # depth i == chi(i+1); torsions at one depth move disjoint atom sets.
         candidates.extend(
             (idx_of[chain[i]], idx_of[chain[i + 1]], i) for i in range(len(chain) - 2)
-        )
+        ) # e.g: [(CA, CB, 0), (CB, CG, 1), (CG, CD,2), ...]
 
     if bonds is None or len(bonds) == 0:
         return []  # without connectivity information we cannot build correct downstream sets
@@ -79,7 +80,7 @@ def build_torsion_index(
     # residue through a cross-link (disulfides) rather than walking the whole chain.
     atom_residue = np.zeros(n_atoms, dtype=np.int64)
     for r in range(len(residue_starts) - 1):
-        atom_residue[residue_starts[r] : residue_starts[r + 1]] = r
+        atom_residue[residue_starts[r] : residue_starts[r + 1]] = r #[N_atoms], contains the residue index for each atom.
     for a, b, depth in candidates:
         moved = _downstream(a, b, adjacency, atom_residue, int(atom_residue[a]))
         if moved is not None and moved.size:
@@ -90,13 +91,15 @@ def build_torsion_index(
 def torsion_index_to_tensors(
     torsions: "list[tuple[int, int, np.ndarray, int]]",
 ) -> "dict[str, torch.Tensor]":
-    """Flatten a torsion index into padding-free tensors for the feature dict.
+    """This function is fed into the Featurizer.get_all_input_features() method, and turns torsions
+    into tensors fed into input_feature_dict, features used during training through apply_torsion_noise() function below
+    
 
     Returns:
-        torsion_pivot   [T, 2]  axis atoms of each torsion
+        torsion_pivot   [T, 2]  atoms at the end of each rotatable bond
         torsion_depth   [T]     chi level (0 = chi1)
-        torsion_atom    [K]     atom indices moved by some torsion
-        torsion_atom_id [K]     which torsion each ``torsion_atom`` entry belongs to
+        torsion_atom    [K]     atom indices moved by torsion 
+        torsion_atom_id [K]     which torsion T each ``torsion_atom`` entry belongs to
     """
     if not torsions:
         return {
@@ -128,7 +131,8 @@ def apply_torsion_noise(
     sigma: torch.Tensor,
     max_angle: float = float(np.pi),
 ) -> torch.Tensor:
-    """Twist every torsion by a random angle scaled to ``sigma``.
+    """Twist every torsion by a random angle scaled to ``sigma``. 
+    Used during /home/dinge/Protenix/protenix/model/generator.py:sample_diffusion_training()
 
     Hinges are nested like joints in an arm: the shoulder moves the elbow, so
     rotations are applied one level at a time (chi1, then chi2, ...) and each level
@@ -151,7 +155,7 @@ def apply_torsion_noise(
     theta_scale = (sigma / 2.0).clamp(max=max_angle)
     angles = torch.randn(
         (*theta_scale.shape, n_torsion), device=coords.device, dtype=coords.dtype
-    ) * theta_scale[..., None]
+    ) * theta_scale[..., None] #randomly sample rotational angle
 
     for depth in torsion_depth.unique(sorted=True):
         at_depth = torsion_depth == depth
@@ -179,6 +183,7 @@ def apply_torsion_noise(
 
 
 def _adjacency(bonds: np.ndarray, n_atoms: int) -> "list[list[int]]":
+    """Builds list of atom indices bonded to each atom """
     adj: "list[list[int]]" = [[] for _ in range(n_atoms)]
     for i, j in bonds[:, :2]:
         adj[int(i)].append(int(j))
@@ -193,24 +198,17 @@ def _downstream(
     atom_residue: Optional[np.ndarray] = None,
     residue: Optional[int] = None,
 ) -> Optional[np.ndarray]:
-    """The atoms that swing when the ``a-b`` bond is twisted.
+    """Starting at ``b`` and never traversing back through ``a``, 
+    this is a depth first search implementation that collects
+    all the atoms that move in coordinate space when the ``a-b`` 
+    bond is twisted. Returns ``None`` when the bond cannot rotate:
 
-    Starting at ``b`` and never stepping back through ``a``, this collects
-    everything on the far side of the hinge. Returns ``None`` when the bond cannot
-    swing after all:
-
-    * the walk loops back around to ``a`` -- the bond is part of a ring, so turning
-      it would be like forcing a hinge set into a closed picture frame;
-    * the walk wanders out of the residue -- a cysteine tethered to a partner by a
-      disulfide, so swinging it would drag the other residue across the structure
-      rather than moving a free side chain.
-
-    Only the first case loops back, so the second has to be caught by checking that
-    the walk stays inside its own residue.
+    * Two "None" cases: the walk loops back around to ``a`` -- the bond is part of a ring (proline / aromatics)
+    * the walk reaches another residue: a disulfide bond connecting two different cysteines 
     """
     seen = {b}
     stack = [b]
-    while stack:
+    while stack: 
         cur = stack.pop()
         for nxt in adjacency[cur]:
             if nxt == a and cur == b:
@@ -224,106 +222,3 @@ def _downstream(
                 stack.append(nxt)
     seen.discard(b)
     return np.fromiter(seen, dtype=np.int64, count=len(seen))
-
-
-def rotate_about_axis(
-    coords: torch.Tensor,
-    pivot_a: torch.Tensor,
-    pivot_b: torch.Tensor,
-    angle: torch.Tensor,
-) -> torch.Tensor:
-    """Rodrigues rotation of ``coords`` about the line ``pivot_a -> pivot_b``.
-
-    Args:
-        coords: ``[..., K, 3]`` points to rotate.
-        pivot_a / pivot_b: ``[..., 3]`` two points defining the axis.
-        angle: ``[...]`` rotation angle in radians.
-
-    Returns:
-        Rotated ``[..., K, 3]``. Distances to the axis are preserved, so all bond
-        lengths and bond angles involving the axis are exactly preserved.
-    """
-    axis = pivot_b - pivot_a
-    axis = axis / axis.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-    v = coords - pivot_b[..., None, :]
-    k = axis[..., None, :]
-    cos_t = torch.cos(angle)[..., None, None]
-    sin_t = torch.sin(angle)[..., None, None]
-    dot = (v * k).sum(-1, keepdim=True)
-    rotated = v * cos_t + torch.cross(k.expand_as(v), v, dim=-1) * sin_t + k * dot * (1 - cos_t)
-    return rotated + pivot_b[..., None, :]
-
-
-class TorsionNoiser:
-    """Apply torsion-space noise to a coordinate tensor.
-
-    The noise magnitude is expressed in the same units the EDM schedule uses
-    (Angstrom of resulting coordinate displacement) and converted to a per-torsion
-    angular scale, so a given ``sigma`` produces roughly the same RMSD as Gaussian
-    noise would. This keeps the EDM preconditioning (which assumes
-    ``x_noisy ~ x + sigma * eps``) approximately valid when the two noising modes
-    are mixed during training.
-
-    Built once per sample from the atom array; the index is static.
-    """
-
-    def __init__(
-        self,
-        atom_names: np.ndarray,
-        res_names: np.ndarray,
-        residue_starts: np.ndarray,
-        n_atoms: int,
-        max_angle: float = np.pi,
-        bonds: Optional[np.ndarray] = None,
-    ) -> None:
-        self.torsions = build_torsion_index(
-            atom_names, res_names, residue_starts, n_atoms, bonds=bonds
-        )
-        self.n_atoms = n_atoms
-        self.max_angle = max_angle
-        moved = np.zeros(n_atoms, dtype=bool)
-        for _, _, m, _d in self.torsions:
-            moved[m] = True
-        # Atoms no torsion can move (backbone, Gly/Ala side chains, ligands, ions,
-        # nucleic acids). Callers apply ordinary Gaussian noise to these.
-        self.residual_mask = torch.from_numpy(~moved)
-        self.moved_mask = torch.from_numpy(moved)
-
-    def __len__(self) -> int:
-        return len(self.torsions)
-
-    def __call__(
-        self,
-        coords: torch.Tensor,
-        sigma: torch.Tensor,
-        generator: Optional[torch.Generator] = None,
-    ) -> torch.Tensor:
-        """Noise ``coords`` by perturbing torsions.
-
-        Args:
-            coords: ``[..., N_atom, 3]``
-            sigma: ``[...]`` noise level (Angstrom), broadcast over the batch.
-
-        Returns:
-            ``[..., N_atom, 3]`` with every bond length and bond angle preserved
-            exactly for the atoms moved by torsions.
-        """
-        if not self.torsions:
-            return coords
-        out = coords.clone()
-        # Map sigma (A) -> angular scale. A torsion rotation displaces a moved atom
-        # by ~ r * theta with r its distance to the axis (~1.5-3 A), so theta ~
-        # sigma / r_typ. Clamped so high-sigma steps stay within a full turn.
-        theta_scale = (sigma / 2.0).clamp(max=self.max_angle)
-        for pivot_a, pivot_b, moved, _d in self.torsions:
-            idx = torch.as_tensor(moved, device=coords.device)
-            shape = theta_scale.shape
-            angle = torch.randn(shape, device=coords.device, dtype=coords.dtype,
-                                generator=generator) * theta_scale
-            out[..., idx, :] = rotate_about_axis(
-                out[..., idx, :],
-                out[..., pivot_a, :],
-                out[..., pivot_b, :],
-                angle,
-            )
-        return out
