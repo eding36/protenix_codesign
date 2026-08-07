@@ -103,6 +103,19 @@ class DataPipeline(object):
                     'Unsupported "dataset", please input either "WeightedPDB" or "Distillation".'
                 )
 
+            # Assembly expansion can emit several copies of the same complex (8tg9:
+            # chains D/F are byte-identical heavy chains). For antibody codesign only
+            # one copy is role-resolved and therefore CDR-masked, so a duplicate sits
+            # in the input with its ground-truth CDR sequence intact and the model can
+            # read the design target straight off it. Drop the redundant copies HERE,
+            # before tokenization, so the token array, every per-atom annotation and
+            # all downstream bookkeeping (labels, chain permutation) are built from a
+            # consistent structure -- removing chains later breaks those invariants.
+            if strip_antibody_cdr and not skip_assembly_expansion:
+                bioassembly_dict["atom_array"] = DataPipeline.keep_one_assembly_copy(
+                    bioassembly_dict["atom_array"]
+                )
+
             sample_indices_list = parser.make_indices(
                 bioassembly_dict=bioassembly_dict,
                 pdb_cluster_file=pdb_cluster_file,
@@ -426,26 +439,7 @@ class DataPipeline(object):
                 cropped_template_features (dict[str, Any]): The cropped template features.
         """
         if crop_size <= 0:
-            # No cropping (the test config's crop_size=-1) still has to deduplicate
-            # antibody assemblies: an unmasked duplicate copy of the designed H/L
-            # chain leaks the CDR sequence outright. This is the branch eval takes,
-            # so the dedup in the cropping path below never runs here.
             selected_indices = None
-            _h, _l = DataPipeline._get_antibody_chains(
-                one_sample=one_sample, bioassembly_dict=bioassembly_dict
-            )
-            if _h is not None or _l is not None:
-                _refs = [c for c in (_h, _l) if c is not None]
-                _n_tok = len(bioassembly_dict["token_array"])
-                _kept = np.asarray(
-                    DataPipeline.drop_duplicate_assembly_copies(
-                        bioassembly_dict=bioassembly_dict,
-                        selected_indices=np.arange(_n_tok),
-                        ref_chain_indices=_refs,
-                    )
-                )
-                if _kept.size < _n_tok:
-                    selected_indices = torch.as_tensor(_kept, dtype=torch.long)
             # Prepare msa
             msa_features = DataPipeline.get_msa_raw_features(
                 bioassembly_dict=bioassembly_dict,
@@ -458,35 +452,10 @@ class DataPipeline(object):
                 selected_indices=selected_indices,
                 template_featurizer=template_featurizer,
             )
-            if selected_indices is None:
-                return (
-                    "no_crop",
-                    bioassembly_dict["token_array"],
-                    bioassembly_dict["atom_array"],
-                    msa_features or {},
-                    template_features or {},
-                    -1,
-                )
-            # Duplicates were removed: materialise the reduced arrays through the
-            # same path the cropper uses, so token/atom bookkeeping stays consistent.
-            dedup_crop = CropData(
-                crop_size=len(bioassembly_dict["token_array"]),
-                ref_chain_indices=_refs,
-                token_array=bioassembly_dict["token_array"],
-                atom_array=bioassembly_dict["atom_array"],
-                method_weights=method_weights,
-                contiguous_crop_complete_lig=contiguous_crop_complete_lig,
-                spatial_crop_complete_lig=spatial_crop_complete_lig,
-                drop_last=drop_last,
-                remove_metal=remove_metal,
-            )
-            dedup_token_array, dedup_atom_array = dedup_crop.crop_by_indices(
-                selected_token_indices=selected_indices,
-            )
             return (
-                "no_crop_dedup",
-                dedup_token_array,
-                dedup_atom_array,
+                "no_crop",
+                bioassembly_dict["token_array"],
+                bioassembly_dict["atom_array"],
                 msa_features or {},
                 template_features or {},
                 -1,
@@ -518,16 +487,6 @@ class DataPipeline(object):
                 one_sample=one_sample, bioassembly_dict=bioassembly_dict
             )
 
-        # Assembly-expanded duplicates are a sequence leak, not just wasted tokens.
-        # A bioassembly often carries several copies of the same complex (8tg9: chains
-        # D/F are byte-identical heavy chains, E/G identical light chains). Only one
-        # copy is role-resolved and therefore CDR-masked, so the *other* copy sits in
-        # the input with its ground-truth CDR sequence intact and the model can simply
-        # read the answer off it. Cropping hides this during training (the Fv alone
-        # nearly fills crop_size), but the test config uses crop_size=-1, so eval saw
-        # the whole assembly. Keep one copy per entity.
-        antibody_dedup = is_antibody
-
         crop = CropData(
             crop_size=crop_size,
             ref_chain_indices=ref_chain_indices,
@@ -550,12 +509,6 @@ class DataPipeline(object):
         selected_indices, reference_token_index = crop.get_crop_indices(
             crop_method=crop_method
         )
-        if antibody_dedup:
-            selected_indices = DataPipeline.drop_duplicate_assembly_copies(
-                bioassembly_dict=bioassembly_dict,
-                selected_indices=selected_indices,
-                ref_chain_indices=ref_chain_indices,
-            )
         # Prepare msa
         cropped_msa_features = DataPipeline.get_msa_raw_features(
             bioassembly_dict=bioassembly_dict,
@@ -592,72 +545,75 @@ class DataPipeline(object):
         )
 
     @staticmethod
-    def drop_duplicate_assembly_copies(
-        bioassembly_dict: dict,
-        selected_indices,
-        ref_chain_indices: list,
-    ):
-        """Keep one chain per entity, dropping assembly-expanded duplicates.
+    def keep_one_assembly_copy(atom_array: AtomArray) -> AtomArray:
+        """Reduce a multi-copy bioassembly to a single coherent copy.
 
-        Entities with only one chain are untouched. Returns ``selected_indices``
-        unchanged if the antibody chains cannot be located, so this can never empty
-        the crop.
+        Assembly expansion can emit several copies of the same complex (8tg9: chains
+        D/F are byte-identical heavy chains). Only one copy carries antibody chain
+        roles and is therefore CDR-masked, so the duplicates sit in the input with
+        the design target in plain sight.
+
+        Copies are identified by ``label_entity_id`` -- an entity with more than one
+        chain has been duplicated. Contact clustering cannot separate them because
+        the copies usually touch. Instead, anchor on the largest chain and, for every
+        other entity, greedily keep the chain nearest the growing selection, which
+        reconstructs one spatially coherent copy rather than a mix of several.
+
+        Returns ``atom_array`` unchanged when no entity has more than one chain.
 
         Args:
-            bioassembly_dict: must carry ``token_array`` and ``atom_array``.
-            selected_indices: token indices chosen by the cropper.
-            ref_chain_indices: ``asym_id_int`` of the heavy/light chains.
+            atom_array: the expanded bioassembly.
 
         Returns:
-            The filtered token indices, in the same order and type as the input.
+            The atom array restricted to one copy, or the input if nothing to drop.
         """
-        token_array = bioassembly_dict["token_array"]
-        atom_array = bioassembly_dict["atom_array"]
+        asym = np.asarray(atom_array.asym_id_int)
+        entity = np.asarray(atom_array.label_entity_id)
+        chains = [int(c) for c in np.unique(asym)]
+        if len(chains) < 2:
+            return atom_array
 
-        sel = np.asarray(selected_indices)
-        if sel.size == 0:
-            return selected_indices
+        ent_of = {c: entity[asym == c][0] for c in chains}
+        ent_chains = defaultdict(list)
+        for c in chains:
+            ent_chains[ent_of[c]].append(c)
+        if all(len(v) == 1 for v in ent_chains.values()):
+            return atom_array  # nothing duplicated
 
-        centre = np.asarray(token_array.get_annotation("centre_atom_index"))[sel]
-        asym = np.asarray(atom_array.asym_id_int)[centre]
-        entity = np.asarray(atom_array.label_entity_id)[centre]
-        coord = np.asarray(atom_array.coord)[centre]
+        coord = np.asarray(atom_array.coord)
+        pts, size = {}, {}
+        for c in chains:
+            xyz = coord[asym == c]
+            size[c] = xyz.shape[0]
+            if xyz.shape[0] > 200:
+                xyz = xyz[:: max(1, xyz.shape[0] // 200)]
+            pts[c] = xyz
 
-        refs = {int(c) for c in ref_chain_indices if c is not None}
-        anchor_mask = np.isin(asym, list(refs)) if refs else np.zeros_like(asym, bool)
-        if not anchor_mask.any():
-            # No antibody chain in the crop -- nothing to anchor "closest copy" on,
-            # and no CDR mask to leak against. Leave the selection alone.
-            return selected_indices
-        anchor = coord[anchor_mask].mean(axis=0)
-
-        keep_asym: set[int] = set()
-        for ent in np.unique(entity):
-            ent_mask = entity == ent
-            chains = np.unique(asym[ent_mask])
-            ref_chains = [int(a) for a in chains if int(a) in refs]
-            if ref_chains:
-                keep_asym.update(ref_chains)
-            elif len(chains) == 1:
-                keep_asym.add(int(chains[0]))
-            else:
-                closest = min(
-                    (int(a) for a in chains),
-                    key=lambda a: float(
-                        np.linalg.norm(coord[asym == a].mean(axis=0) - anchor)
-                    ),
-                )
-                keep_asym.add(closest)
-
-        keep = np.isin(asym, list(keep_asym))
-        if not keep.any():
-            return selected_indices
-        filtered = sel[keep]
-        if isinstance(selected_indices, torch.Tensor):
-            return torch.as_tensor(
-                filtered, dtype=selected_indices.dtype, device=selected_indices.device
+        def min_dist(c: int, ref: np.ndarray) -> float:
+            return float(
+                np.linalg.norm(pts[c][:, None, :] - ref[None, :, :], axis=-1).min()
             )
-        return filtered
+
+        anchor = max(chains, key=lambda c: size[c])
+        keep = [anchor]
+        ref = pts[anchor]
+        # Largest entities first: the big chains pin down which copy we are on
+        # before small cofactors, whose copies sit close together.
+        remaining = sorted(
+            (e for e in ent_chains if e != ent_of[anchor]),
+            key=lambda e: -max(size[c] for c in ent_chains[e]),
+        )
+        for ent in remaining:
+            cands = ent_chains[ent]
+            pick = cands[0] if len(cands) == 1 else min(
+                cands, key=lambda c: min_dist(c, ref)
+            )
+            keep.append(pick)
+            ref = np.concatenate([ref, pts[pick]])
+
+        if len(keep) == len(chains):
+            return atom_array
+        return atom_array[np.isin(asym, keep)]
 
     @staticmethod
     def save_atoms_to_cif(
