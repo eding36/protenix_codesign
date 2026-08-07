@@ -139,9 +139,9 @@ def torsion_index_to_tensors(
 
     Returns:
         torsion_pivot   [T, 2]  atoms at the end of each rotatable bond
-        torsion_depth   [T]     chi level (0 = chi1)
-        torsion_atom    [K]     atom indices moved by torsion 
-        torsion_atom_id [K]     which torsion T each ``torsion_atom`` entry belongs to
+        torsion_depth   [T]     a list of all torsional chi angles for each residue, starting at 0 every time for each residue (e.g. [0,1,2,3, 0,1, 0, 0,1,2, ...] — a LYS contributing 0,1,2,3, a SER just 0 )
+        torsion_atom    [K]     atom indices moved by each torsion chi angle T 
+        torsion_atom_id [K]     which torsion chi angles ranging from [0,T] each ``torsion_atom`` entry belongs to
     """
     if not torsions:
         return {
@@ -197,21 +197,23 @@ def apply_torsion_noise(
     theta_scale = (sigma / 2.0).clamp(max=max_angle)
     angles = torch.randn(
         (*theta_scale.shape, n_torsion), device=coords.device, dtype=coords.dtype
-    ) * theta_scale[..., None] #randomly sample rotational angle
+    ) * theta_scale[..., None] #randomly sample rotational angles
 
-    for depth in torsion_depth.unique(sorted=True):
-        at_depth = torsion_depth == depth
-        entries = at_depth[torsion_atom_id]
+    for depth in torsion_depth.unique(sorted=True): #iterate up to max torsional depth (residue with max # of chi angles)
+        at_depth = torsion_depth == depth #at_depth is a boolean array that labels which chi angles for each residue should change at the current depth. 
+        entries = at_depth[torsion_atom_id] 
         if not bool(entries.any()):
             continue
-        aidx = torsion_atom[entries]
-        tid = torsion_atom_id[entries]
-        pa = out[..., torsion_pivot[tid, 0], :]
-        pb = out[..., torsion_pivot[tid, 1], :]
-        ang = angles[..., tid]
-        axis = pb - pa
+        aidx = torsion_atom[entries] #list of atom indices that should be perturbed at the current torsional depth
+        tid = torsion_atom_id[entries] #list containing torsion indices that move each atom
+        pa = out[..., torsion_pivot[tid, 0], :] #fetch the position of atom a's moved by given torsion indices 
+        pb = out[..., torsion_pivot[tid, 1], :] #fetch the position of atom b's moved by given torsion indices 
+        ang = angles[..., tid] #fetch torsion angles for each torsion indice
+        
+        #Implementation of the Rodrigues rotation
+        axis = pb - pa #fetch all axis of rotations
         axis = axis / axis.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        v = out[..., aidx, :] - pb
+        v = out[..., aidx, :] - pb 
         cos_t = torch.cos(ang)[..., None]
         sin_t = torch.sin(ang)[..., None]
         dot = (v * axis).sum(-1, keepdim=True)
