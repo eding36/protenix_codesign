@@ -36,14 +36,14 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --project protenix \
 --use_wandb true \
 --diffusion_batch_size 1 \
---eval_interval 5000 \
+--eval_interval 2000 \
 --log_interval 50 \
---checkpoint_interval 5000 \
+--checkpoint_interval 2000 \
 --ema_decay 0.999 \
 --eval_ema_only true \
---test_max_n_token 2048 \
+--test_max_n_token 1024 \
 --train_crop_size 512 \
---max_steps 20000 \
+--max_steps 10000 \
 --warmup_steps 200 \
 --lr 0.0002 \
 --model.N_cycle 4 \
@@ -63,5 +63,5 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --antibody_add_antigen true \
 --antibody_min_neighborhood 0 \
 --antibody_max_neighborhood 40 \
---antibody_mixed_prob 0.5 \
---torsion_noise_prob 0.3
+--antibody_mixed_prob 0.0 \
+--torsion_noise_prob 0.4
