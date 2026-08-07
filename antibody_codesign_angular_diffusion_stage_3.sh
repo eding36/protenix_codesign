@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 export PYTHONPATH="${PYTHONPATH}:$(pwd)"
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0,1
 # fast_layernorm is used by default, no need to set explicitly. Set LAYERNORM_TYPE=torch to disable.
 # NOTE: the fused fast_layernorm CUDA kernel is NOT built for Blackwell (sm_120) and
 # silently returns its input UNNORMALIZED there, so the pair rep explodes to NaN.
