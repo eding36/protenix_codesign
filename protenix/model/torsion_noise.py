@@ -28,6 +28,48 @@ SC_ORDER = {
 }
 #e.g. {"ALA":("CB","CG",...all side chain atoms)}
 
+def _adjacency(bonds: np.ndarray, n_atoms: int) -> "list[list[int]]":
+    """Builds list of atom indices bonded to each atom """
+    adj: "list[list[int]]" = [[] for _ in range(n_atoms)]
+    for i, j in bonds[:, :2]:
+        adj[int(i)].append(int(j))
+        adj[int(j)].append(int(i))
+    return adj
+
+
+def _downstream(
+    a: int,
+    b: int,
+    adjacency: "list[list[int]]",
+    atom_residue: Optional[np.ndarray] = None,
+    residue: Optional[int] = None,
+) -> Optional[np.ndarray]:
+    """Starting at ``b`` and never traversing back through ``a``, 
+    this is a depth first search implementation that collects
+    all the atoms that move in coordinate space when the ``a-b`` 
+    bond is twisted. Returns ``None`` when the bond cannot rotate:
+
+    * Two "None" cases: the walk loops back around to ``a``:
+        --the bond is part of a ring (proline / aromatics)
+        --the walk reaches another residue: a disulfide bond connecting two different cysteines 
+    """
+    seen = {b}
+    stack = [b]
+    while stack: 
+        cur = stack.pop()
+        for nxt in adjacency[cur]:
+            if nxt == a and cur == b:
+                continue  # the torsion bond itself
+            if nxt == a:
+                return None  # cycle back to the pivot -> ring bond, not rotatable
+            if nxt not in seen:
+                if atom_residue is not None and atom_residue[nxt] != residue:
+                    return None  # cross-link out of the residue (disulfide)
+                seen.add(nxt)
+                stack.append(nxt)
+    seen.discard(b)
+    return np.fromiter(seen, dtype=np.int64, count=len(seen))
+
 
 def build_torsion_index(
     atom_names: np.ndarray,
@@ -180,45 +222,3 @@ def apply_torsion_noise(
             + pb
         )
     return out
-
-
-def _adjacency(bonds: np.ndarray, n_atoms: int) -> "list[list[int]]":
-    """Builds list of atom indices bonded to each atom """
-    adj: "list[list[int]]" = [[] for _ in range(n_atoms)]
-    for i, j in bonds[:, :2]:
-        adj[int(i)].append(int(j))
-        adj[int(j)].append(int(i))
-    return adj
-
-
-def _downstream(
-    a: int,
-    b: int,
-    adjacency: "list[list[int]]",
-    atom_residue: Optional[np.ndarray] = None,
-    residue: Optional[int] = None,
-) -> Optional[np.ndarray]:
-    """Starting at ``b`` and never traversing back through ``a``, 
-    this is a depth first search implementation that collects
-    all the atoms that move in coordinate space when the ``a-b`` 
-    bond is twisted. Returns ``None`` when the bond cannot rotate:
-
-    * Two "None" cases: the walk loops back around to ``a`` -- the bond is part of a ring (proline / aromatics)
-    * the walk reaches another residue: a disulfide bond connecting two different cysteines 
-    """
-    seen = {b}
-    stack = [b]
-    while stack: 
-        cur = stack.pop()
-        for nxt in adjacency[cur]:
-            if nxt == a and cur == b:
-                continue  # the torsion bond itself
-            if nxt == a:
-                return None  # cycle back to the pivot -> ring bond, not rotatable
-            if nxt not in seen:
-                if atom_residue is not None and atom_residue[nxt] != residue:
-                    return None  # cross-link out of the residue (disulfide)
-                seen.add(nxt)
-                stack.append(nxt)
-    seen.discard(b)
-    return np.fromiter(seen, dtype=np.int64, count=len(seen))
