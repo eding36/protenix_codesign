@@ -44,7 +44,7 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --ema_decay 0.999 \
 --train_crop_size 384 \
 --max_steps 12000 \
---warmup_steps 2000 \
+--warmup_steps 200 \
 --lr 0.0002 \
 --model.N_cycle 4 \
 --model.diffusion_module.sequence_noise_type discrete_absorb \
