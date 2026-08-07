@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full test-set codesign eval on the `codesign` branch.
+# Full test-set codesign eval.
 #
 # Runs runner/train.py in --eval_only mode over the ENTIRE antibody codesign test
 # set, with replacement sampling (structural inpainting at every denoising step)
@@ -47,11 +47,11 @@ TORCHRUN="${TORCHRUN:-/home/dinge/miniconda3/envs/protenix/bin/torchrun}"
 # ---- preflight ---------------------------------------------------------------
 # A 2-3 day run must not die on something knowable in the first second.
 
-# This script lives on codesign, angular_diffusion and structural_tokendenoiser,
+# This script lives on base_codesign, angular_diffusion and structural_tokendenoiser,
 # which train different models -- so the guard is against launching a multi-day
 # run from whichever branch happened to be checked out, not against any one
 # branch. Override when you genuinely mean to evaluate another one.
-EXPECT_BRANCH="${EXPECT_BRANCH:-codesign}"
+EXPECT_BRANCH="${EXPECT_BRANCH:-base_codesign}"
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 if [[ "${BRANCH}" != "${EXPECT_BRANCH}" ]]; then
   echo "[error] on branch '${BRANCH}', expected '${EXPECT_BRANCH}'." >&2
