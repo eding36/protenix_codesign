@@ -238,6 +238,8 @@ class SequenceD3PM(nn.Module):
         c_z: int = 256,
         n_pair_blocks: int = 2,
         n_pair_heads: int = 8,
+        n_dist_bins: int = 32,
+        dist_max: float = 32.0,
     ):
         super().__init__()
         self.type_embed = nn.Embedding(4, hidden_dim, padding_idx=0) # 1: Heavy, 2: Light, 3: Ag
@@ -265,6 +267,12 @@ class SequenceD3PM(nn.Module):
         self.pair_transition = nn.ModuleList([
             Transition(c_in=hidden_dim, n=2) for _ in range(n_pair_blocks)
         ])
+        # Pair bias from the current denoised structure. z_pair is static across
+        # denoising steps; binned distances are not. Zero-init = starts a no-op.
+        self.n_dist_bins = n_dist_bins
+        self.dist_max = dist_max
+        self.dist_embed = nn.Embedding(n_dist_bins, c_z)
+        nn.init.zeros_(self.dist_embed.weight)
         self.decoder = nn.Sequential(
             nn.Linear(hidden_dim, 2 * hidden_dim),
             nn.GELU(),
@@ -274,7 +282,7 @@ class SequenceD3PM(nn.Module):
         )
 
 
-    def forward(self, res_feat, cond=None, z=None):
+    def forward(self, res_feat, cond=None, z=None, x_token=None):
         """Denoise the sequence feature.
 
         Args:
@@ -287,6 +295,10 @@ class SequenceD3PM(nn.Module):
                 reason about interface/epitope neighbours. When ``None`` the module
                 falls back to the pure per-token path (no neighbour attention).
 
+            x_token: per-token coordinates of the current denoised structure,
+                ``[..., N_sample, N_token, 3]``. Binned pairwise distances are added
+                to ``z``. Ignored when ``None``.
+
         Returns:
             res (batch_size, max_tokens, vocab_size): The denoised sequence one-hot code.
         """
@@ -295,6 +307,13 @@ class SequenceD3PM(nn.Module):
         region_embed = self.region_embed(cond["region"])
         res = torch.cat([res, type_embed, region_embed], dim=-1)
         res = self.dropout(self.LayerNorm(self.proj(res)))
+        if z is not None and x_token is not None:
+            d = torch.cdist(x_token.float(), x_token.float())
+            bins = torch.clamp(
+                (d / self.dist_max * self.n_dist_bins).long(), 0, self.n_dist_bins - 1
+            )
+            z = z + self.dist_embed(bins)  # z broadcasts over the bias's N_sample dim
+
         # Reason about interface/epitope neighbours directly via z_pair.
         if z is not None:
             for attn, transition in zip(self.pair_attn, self.pair_transition):
@@ -575,30 +594,6 @@ class DiffusionModule(nn.Module):
         )
 
         a_token = self.layernorm_a(a_token)
-        """Sequence denoising"""
-        if self.sequence_train:
-            cond = {}
-            # Expand the per-token conditioning to a_token's N_sample dim
-            # (a_token is [..., N_sample, N_token, c_token]) so the type/region
-            # embeddings concatenate cleanly inside SequenceD3PM. MFDesign achieves
-            # the same via repeat_interleave(multiplicity) after flattening
-            # batch*multiplicity; Protenix keeps N_sample as a separate axis.
-            N_sample = a_token.shape[-3]
-            cond["type"] = expand_at_dim(
-                input_feature_dict["chain_type"], dim=-2, n=N_sample
-            )  # [..., N_sample, N_token]
-            cond["region"] = expand_at_dim(
-                input_feature_dict["region_type"], dim=-2, n=N_sample
-            )  # [..., N_sample, N_token]
-            # Pass the (standard-layout, unpermuted) pair rep so the sequence head can
-            # attend over interface/epitope neighbours. z_pair is [..., 1, N_token,
-            # N_token, c_z]; its singleton sample dim broadcasts over a_token's
-            # N_sample exactly as it does for the diffusion transformer above.
-            k_denoised = self.sequence_model(
-                a_token, cond, z=z_pair.to(dtype=torch.float32)
-            )
-        else:
-            k_denoised = None
 
         # Fine-grained checkpoint for finetuning stage 2 (token num: 768) for avoiding OOM
         if blocks_per_ckpt and self.use_fine_grained_checkpoint:
@@ -624,6 +619,47 @@ class DiffusionModule(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
+        """Sequence denoising"""
+        if self.sequence_train:
+            cond = {} 
+            N_sample = a_token.shape[-3]
+            cond["type"] = expand_at_dim(
+                input_feature_dict["chain_type"], dim=-2, n=N_sample
+            )  # [..., N_sample, N_token]
+            cond["region"] = expand_at_dim(
+                input_feature_dict["region_type"], dim=-2, n=N_sample
+            )  # [..., N_sample, N_token]
+            
+            # Denoised coords, reconstructed locally from what EDM does outside:
+            #   x_noisy = r_noisy * sqrt(sigma_data^2 + sigma^2)
+            #   x_den   = x_noisy/(1+s^2) + sigma/sqrt(1+s^2) * r_update,  s = sigma/sigma_data
+            sig = t_hat_noise_level[..., None, None].to(r_update.dtype)
+            s_ratio = sig / self.sigma_data
+            x_noisy_ = r_noisy * torch.sqrt(self.sigma_data**2 + sig**2) #scale back to real coords
+            x_denoised = x_noisy_ / (1 + s_ratio**2) + sig / torch.sqrt(
+                1 + s_ratio**2
+            ) * r_update #EDM denoising
+            # Atom -> token coordinates (mean over each token's atoms).
+            a2t = input_feature_dict["atom_to_token_idx"].long().reshape(-1)
+            n_tok = a_token.shape[-2]
+            shp = (*x_denoised.shape[:-2], n_tok, 3)
+            sums = x_denoised.new_zeros(shp).index_add_(
+                -2, a2t, x_denoised.to(x_denoised.dtype)
+            ) #For each token indice, sum all xyz positions of all its atoms
+            cnts = x_denoised.new_zeros(n_tok).index_add_(
+                0, a2t, torch.ones_like(a2t, dtype=x_denoised.dtype)
+            ) #count how many atoms per residue
+            x_token = sums / cnts.clamp(min=1.0)[..., None] #find centroid for each residue by averaging atom positions.
+            # Detached: sequence loss should be independent from structure modules.
+            k_denoised = self.sequence_model(
+                a_token,
+                cond,
+                z=z_pair.to(dtype=torch.float32),
+                x_token=x_token.detach().float(),
+            ) #pass z_pair rep so the sequence head can attend over interface/epitope neighbours. z_pair is [..., 1, N_token,
+        else:
+            k_denoised = None
+
         # k_denoised is the sequence-model output when sequence_train, else None.
         # Always return the pair so callers need no branching on return arity.
         return r_update, k_denoised
