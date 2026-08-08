@@ -37,6 +37,9 @@ basic_configs = {
     # antigen and generate only the CDRs, conditioning the design on the given
     # co-crystal structure. Off by default -- it changes what the metrics mean.
     "eval_structure_inpainting": False,
+    # Shapes the sequence timestep distribution. seq_t = floor(T * u**power), u~U(0,1).
+    # 1.0 = uniform (original). <1.0 shifts mass toward FULLY MASKED CDRs
+    "seq_timestep_power": 1.0,
     "freeze_sequence_mlp_steps": 0,
     "eval_only": False,
     "load_checkpoint_path": "",
