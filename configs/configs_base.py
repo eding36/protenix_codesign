@@ -37,6 +37,12 @@ basic_configs = {
     # antigen and generate only the CDRs, conditioning the design on the given
     # co-crystal structure. Off by default -- it changes what the metrics mean.
     "eval_structure_inpainting": False,
+    # Sequence decoding during the eval/inference rollout.
+    # seq_sample=True samples each token from the logits at EVERY reverse step;
+    # False takes the argmax. Training accuracy is measured on the argmax, so a
+    # sampled decode is not comparable to it and compounds over 200 steps.
+    "seq_sample": True,
+    "seq_temperature": 1.0,
     # Shapes the sequence timestep distribution. seq_t = floor(T * u**power), u~U(0,1).
     # 1.0 = uniform (original). <1.0 shifts mass toward FULLY MASKED CDRs
     "seq_timestep_power": 1.0,
