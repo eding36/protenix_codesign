@@ -645,6 +645,7 @@ def sample_diffusion_training(
     sequence_train: bool = False,
     noise_type: str = "discrete_uniform",
     n_steps_seq: int = 200,
+    seq_timestep_power: float = 1.0,
     seq_sigma_schedule: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Implements diffusion training as described in AF3 Appendix at page 23.
@@ -705,7 +706,16 @@ def sample_diffusion_training(
         assert seq_sigma_schedule is not None, (
             "seq_sigma_schedule required for coupled discrete sequence training"
         )
-        seq_t = torch.randint(n_steps_seq, size=(1,), device=device)  # sampled sequence noise level
+        if seq_timestep_power == 1.0:
+            seq_t = torch.randint(n_steps_seq, size=(1,), device=device)
+        else:
+            # u**power with power<1 pushes u toward 1, i.e. toward fully-masked CDRs.
+            u = torch.rand(1, device=device)
+            seq_t = (
+                (u.pow(seq_timestep_power) * n_steps_seq)
+                .long()
+                .clamp(max=n_steps_seq - 1)
+            )
         coupled_sigma = seq_sigma_schedule.to(device=device, dtype=dtype)[
             n_steps_seq - 1 - seq_t
         ]  # corresponding structure noise level 
@@ -720,6 +730,7 @@ def sample_diffusion_training(
     noise = torch.randn_like(x_gt_augment, dtype=dtype) * sigma[..., None, None]
 
     """Sequence noising process, only at CDR residues"""
+    returned_seq_mask = None
     if sequence_train:
         # One diffusion timestep per SEQUENCE (MFDesign samples per-sequence, not
         # per-token). Protenix runs unbatched (seq is [N_token]); add a batch dim of
@@ -739,7 +750,11 @@ def sample_diffusion_training(
         if noise_type == "discrete_absorb":
             masked_seq, seq_mask = res
             input_feature_dict["masked_seq"] = masked_seq.squeeze(0)   # [N_token]
+            # NOTE: under DDP this dict is a SCATTERED COPY -- mutations here do not
+            # reach the caller, so the loss cannot read seq_mask from it. It is also
+            # returned below and routed through pred_dict, which does survive.
             input_feature_dict["seq_mask"] = seq_mask.squeeze(0)
+            returned_seq_mask = seq_mask.squeeze(0)
         elif noise_type == "discrete_uniform":
             # res is a per-token distribution [1, N_token, vocab]; sample token ids.
             # No boltz "+2" offset: Protenix amino acids already occupy ids 0-19.
@@ -807,4 +822,4 @@ def sample_diffusion_training(
             if all(k is not None for k in k_chunks)
             else None
         )
-    return x_gt_augment, x_denoised, k_denoised, sigma
+    return x_gt_augment, x_denoised, k_denoised, sigma, returned_seq_mask
