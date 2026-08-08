@@ -877,7 +877,7 @@ class Protenix(nn.Module):
         drop_conditioning = (
             random.random() < self.configs.model.condition_embedding_drop_rate
         )
-        _, x_denoised, k_denoised, x_noise_level = autocasting_disable_decorator(
+        _, x_denoised, k_denoised, x_noise_level, seq_mask_out = autocasting_disable_decorator(
             self.configs.skip_amp.sample_diffusion_training
         )(sample_diffusion_training)(
             noise_sampler=self.train_noise_sampler,
@@ -900,7 +900,8 @@ class Protenix(nn.Module):
             sequence_train = self.sequence_train,
             noise_type = self.seq_noise_type,
             n_steps_seq = self.n_steps_seq,
-            seq_sigma_schedule = self.seq_sigma_schedule
+            seq_sigma_schedule = self.seq_sigma_schedule,
+            seq_timestep_power = self.diffusion_module.seq_timestep_power,
         )
         pred_dict.update(
             {
@@ -914,6 +915,12 @@ class Protenix(nn.Module):
         )
         if self.sequence_train:
                 pred_dict["sequence"] = k_denoised
+                # Routed through pred_dict, not input_feature_dict: DDP scatters the
+                # input containers, so mutations inside the model never reach the
+                # loss and it would silently score every CDR position -- including
+                # the ones handed the ground-truth token.
+                if seq_mask_out is not None:
+                    pred_dict["seq_mask"] = seq_mask_out
 
         # Permute symmetric atom/chain in each sample to match true structure
         # Note: currently chains cannot be permuted since label is cropped
