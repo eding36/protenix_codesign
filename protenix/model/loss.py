@@ -1568,6 +1568,7 @@ class SequenceLoss(nn.Module):
         denoised_seqs: torch.Tensor,
         seqs_ground_truth: torch.Tensor,
         seq_masks: torch.Tensor,
+        cdr_all: torch.Tensor = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Args:
@@ -1613,20 +1614,42 @@ class SequenceLoss(nn.Module):
 
         # Standard amino-acid tokens inside the design region only.
         valid_mask = (gt >= self._AA_MIN) & (gt <= self._AA_MAX) & mask.bool()
+        # Every designable position, masked or not -- the denominator for the
+        # realized mask rate (valid_mask is only the subset actually masked).
+        designable = (gt >= self._AA_MIN) & (gt <= self._AA_MAX) & cdr_all.bool() \
+            if cdr_all is not None else None
         denoised_filtered = denoised_seqs[valid_mask]  # [n_valid, vocab_size]
         gt_filtered = gt[valid_mask]  # [n_valid]; already 0-19, no shift
 
         loss_fct = nn.CrossEntropyLoss(reduction="mean")
         if denoised_filtered.numel() > 0:
             seq_loss = loss_fct(denoised_filtered, gt_filtered)
-            seq_acc = (
-                denoised_filtered.argmax(dim=-1) == gt_filtered
-            ).float().mean()
+            correct = (denoised_filtered.argmax(dim=-1) == gt_filtered).float()
+            seq_acc = correct.mean()
         else:
             # No designable tokens in this batch: keep the grad path alive.
             seq_loss = 0.0 * denoised_seqs.sum()
+            correct = denoised_seqs.new_zeros((0,))
             seq_acc = denoised_seqs.new_zeros(())
-        return seq_loss, {"seq_acc": seq_acc}
+        metrics = {"seq_acc": seq_acc}
+
+        # Diagnostics for the timestep skew (seq_timestep_power).
+        #
+        # seq_acc alone is misleading: it averages per STEP, so a step masking 3
+        # residues counts as much as one masking 50, and the low-mask steps -- where
+        # the model still sees most of the true CDR -- score near 1.0. These report
+        # how much was actually masked and how accuracy behaves at the hard end,
+        # which is the regime eval measures.
+        if designable is not None and designable.any():
+            n_design = designable.sum().float()
+            rate = valid_mask.sum().float() / n_design.clamp(min=1.0)
+            metrics["seq_mask_rate"] = rate
+            # Accuracy on this step only when it is a mostly-masked (eval-like) one;
+            # NaN otherwise so the metric aggregator skips it rather than averaging
+            # in an easy step.
+            if float(rate) >= 0.75 and correct.numel() > 0:
+                metrics["seq_acc_high_mask"] = correct.mean()
+        return seq_loss, metrics
 
 
 class ProtenixLoss(nn.Module):
@@ -1953,18 +1976,24 @@ class ProtenixLoss(nn.Module):
                 # seq_mask exists only on the training path; eval seeds every CDR
                 # position masked, so the design region there is the whole cdr_mask.
                 noise_type = self.configs.model.diffusion_module.sequence_noise_type
-                seq_mask = (
-                    feat_dict["seq_mask"]
-                    if noise_type == "discrete_absorb"
-                    and feat_dict.get("seq_mask") is not None
-                    else feat_dict["cdr_mask"]
-                )
+                # Prefer pred_dict: DDP scatters input_feature_dict, so anything the
+                # model writes there never reaches this point and we would silently
+                # fall back to cdr_mask -- scoring every CDR position, including the
+                # ones the model was handed the ground-truth token for.
+                seq_mask = None
+                if noise_type == "discrete_absorb":
+                    seq_mask = pred_dict.get("seq_mask")
+                    if seq_mask is None:
+                        seq_mask = feat_dict.get("seq_mask")
+                if seq_mask is None:
+                    seq_mask = feat_dict["cdr_mask"]
                 loss_fns.update(
                     {
                         "sequence_loss": lambda: self.sequence_loss(
                             denoised_seqs=pred_dict["sequence"],
                             seqs_ground_truth=feat_dict["seq"],
                             seq_masks=seq_mask,
+                            cdr_all=feat_dict.get("cdr_mask"),
                         )
                     }
                 )
