@@ -323,6 +323,7 @@ class DiffusionModule(nn.Module):
         blocks_per_ckpt: Optional[int] = None,
         use_fine_grained_checkpoint: bool = False,
         sequence_train: bool = False,
+        seq_timestep_power: float = 1.0,
         sequence_model_args: Optional[dict[str, Any]] = None,
         sequence_noise_type: str = "discrete_uniform",
         N_steps_seq: int = 200,
@@ -355,6 +356,7 @@ class DiffusionModule(nn.Module):
         )
         """Sequence denoising head, codesign implementation"""
         self.sequence_train = sequence_train
+        self.seq_timestep_power = seq_timestep_power
         self.sequence_noise_type = sequence_noise_type
         self.N_steps_seq = N_steps_seq
         if sequence_train:

@@ -19,6 +19,7 @@
 # features: default, constraint, esm, etc, if multiple split by "-"
 # version: v{x}.{y}.{z}
 
+from protenix.config.extend_types import GlobalConfigValue
 """
 # Currently, the following models are supported. Unless specified otherwise,
 # models are trained based on the 2021-09-30 wwPDB cutoff.
@@ -96,6 +97,7 @@ model_configs = {
                 "sequence_train": True,
                 "sequence_noise_type": "discrete_uniform",
                 "N_steps_seq": 200,
+                "seq_timestep_power": GlobalConfigValue("seq_timestep_power"),
                 "sequence_model_args": {
                     "hidden_dim": 768,
                     "vocab_size": 20,
