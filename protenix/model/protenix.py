@@ -603,6 +603,8 @@ class Protenix(nn.Module):
                 noise_type=self.seq_noise_type,
                 restype_offset=self.c_s,
                 restype_width=len(STD_RESIDUES_WITH_GAP),
+                seq_sample=getattr(self.configs, "seq_sample", True),
+                seq_temperature=getattr(self.configs, "seq_temperature", 1.0),
             )
         # Replacement sampling (MFDesign Alg. S3): condition the CDR design on the
         # given co-crystal structure. Atoms the model may generate = CDR atoms plus
