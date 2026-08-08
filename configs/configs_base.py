@@ -44,6 +44,12 @@ basic_configs = {
     # antigen and generate only the CDRs, conditioning the design on the given
     # co-crystal structure. Off by default -- it changes what the metrics mean.
     "eval_structure_inpainting": False,
+    # Shapes the sequence timestep distribution. seq_t = floor(T * u**power), u~U(0,1).
+    # 1.0 = uniform (original). <1.0 shifts mass toward FULLY MASKED CDRs.
+    # NOTE: seq_t is coupled to structure noise (sigma = schedule[T-1-seq_t]), so
+    # lowering this also shifts structure training toward high sigma -- which makes
+    # the sigma <= torsion_sigma_max gate fire less often.
+    "seq_timestep_power": 1.0,
     "eval_only": False,
     "load_checkpoint_path": "",
     "load_ema_checkpoint_path": "",
