@@ -37,6 +37,7 @@ basic_configs = {
     # antigen and generate only the CDRs, conditioning the design on the given
     # co-crystal structure. Off by default -- it changes what the metrics mean.
     "eval_structure_inpainting": False,
+    "freeze_sequence_mlp_steps": 0,
     "eval_only": False,
     "load_checkpoint_path": "",
     "load_ema_checkpoint_path": "",

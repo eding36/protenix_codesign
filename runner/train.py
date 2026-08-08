@@ -862,10 +862,36 @@ class AF3Trainer(object):
             if self.configs.use_wandb and DIST_WRAPPER.rank == 0:
                 wandb.log(metrics, step=self.step)
 
+    def _frozen_seq_mlp_params(self):
+        """The pretrained sequence-head params, i.e. everything except the new blocks."""
+        if getattr(self, "_frozen_cache", None) is None:
+            new_blocks = ("pair_attn", "pair_transition", "dist_embed")
+            self._frozen_cache = [
+                p
+                for n, p in self.model.named_parameters()
+                if "sequence_model." in n and not any(b in n for b in new_blocks)
+            ]
+        return self._frozen_cache
+
     def update(self) -> None:
         """
         Apply gradient clipping to model parameters.
         """
+        # Zero (not requires_grad=False) so DDP still reduces every param and the
+        # bucket layout never changes mid-run; the optimizer just applies nothing.
+        n_freeze = getattr(self.configs, "freeze_sequence_mlp_steps", 0)
+        if n_freeze and self.step < n_freeze:
+            for p in self._frozen_seq_mlp_params():
+                if p.grad is not None:
+                    p.grad.zero_()
+            if self.step == 0:
+                self.print(
+                    f"Freezing {len(self._frozen_seq_mlp_params())} pretrained "
+                    f"sequence-MLP tensors until step {n_freeze}"
+                )
+        elif n_freeze and self.step == n_freeze:
+            self.print(f"Unfroze sequence MLP at step {self.step}")
+
         if self.configs.grad_clip_norm != 0.0:
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.configs.grad_clip_norm
