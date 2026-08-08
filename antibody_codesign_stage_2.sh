@@ -25,7 +25,7 @@ export CUDA_VISIBLE_DEVICES=0,1
 # Specify your data root directory by uncommenting the following line.
 export PROTENIX_ROOT_DIR="/home/dinge/data/proj/protenix_codesign/data"
 # wget -P $PROTENIX_ROOT_DIR/checkpoint/ https://protenix.tos-cn-beijing.volces.com/checkpoint/protenix_base_default_v1.0.0.pt
-checkpoint_path="/home/dinge/Protenix/output/protenix_antibody_codesign_stage_1b_structural_tokendenoiser_20260805_223715/checkpoints/stage_1b.pt"
+checkpoint_path="/home/dinge/Protenix/output/protenix_antibody_codesign_stage_1b_structural_tokendenoiser_20260808_002617/checkpoints/stage_1b.pt"
 torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --model_name "protenix_base_default_v1.0.0_codesign" \
 --run_name protenix_antibody_codesign_stage_2_structural_tokendenoiser \
@@ -59,7 +59,7 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --data.template.enable_prot_template false \
 --data.msa.enable_prot_msa true \
 --data.msa.enable_rna_msa false \
---loss.weight.alpha_sequence 1.0 \
+--loss.weight.alpha_sequence 2.0 \
 --antibody_add_antigen true \
 --antibody_min_neighborhood 0 \
 --antibody_max_neighborhood 40 \
