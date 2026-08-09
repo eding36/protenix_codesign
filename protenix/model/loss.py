@@ -1626,12 +1626,15 @@ class SequenceLoss(nn.Module):
             seq_loss = loss_fct(denoised_filtered, gt_filtered)
             correct = (denoised_filtered.argmax(dim=-1) == gt_filtered).float()
             seq_acc = correct.mean()
+            metrics = {"seq_acc": seq_acc}
         else:
-            # No designable tokens in this batch: keep the grad path alive.
+            # Nothing was masked this step, so there is nothing to score. Log NO
+            # accuracy rather than 0.0: at low mask rates P(no position masked) =
+            # (1-rate)^n_cdr, which is 2-8% of steps, and averaging those zeros in
+            # dragged a true 0.98 down to ~0.90. Keep the grad path alive.
             seq_loss = 0.0 * denoised_seqs.sum()
             correct = denoised_seqs.new_zeros((0,))
-            seq_acc = denoised_seqs.new_zeros(())
-        metrics = {"seq_acc": seq_acc}
+            metrics = {}
 
         # Diagnostics for the timestep skew (seq_timestep_power).
         #
