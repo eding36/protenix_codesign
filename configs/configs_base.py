@@ -56,6 +56,12 @@ basic_configs = {
     # lowering this also shifts structure training toward high sigma -- which makes
     # the sigma <= torsion_sigma_max gate fire less often.
     "seq_timestep_power": 1.0,
+    # Scheduled sampling: probability a training step rebuilds the CDR context from
+    # the model's OWN predictions instead of ground truth, so training sees the kind
+    # of imperfect context the 200-step eval rollout actually provides. Measured
+    # exposure-bias cost on this model is ~0.30 AAR. 0.0 = off (teacher forcing).
+    # Costs one extra no_grad forward on the steps it fires.
+    "self_conditioning_prob": 0.0,
     "eval_only": False,
     "load_checkpoint_path": "",
     "load_ema_checkpoint_path": "",

@@ -104,6 +104,7 @@ model_configs = {
                 "torsion_noise_prob": GlobalConfigValue("torsion_noise_prob"),
                 "torsion_sigma_max": GlobalConfigValue("torsion_sigma_max"),
                 "seq_timestep_power": GlobalConfigValue("seq_timestep_power"),
+                "self_conditioning_prob": GlobalConfigValue("self_conditioning_prob"),
                 "sequence_model_args": {
                     "hidden_dim": 768,
                     "vocab_size": 20,

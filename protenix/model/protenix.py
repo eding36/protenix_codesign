@@ -906,6 +906,7 @@ class Protenix(nn.Module):
             torsion_sigma_max = self.diffusion_module.torsion_sigma_max,
             seq_sigma_schedule = self.seq_sigma_schedule,
             seq_timestep_power = self.diffusion_module.seq_timestep_power,
+            self_conditioning_prob = self.diffusion_module.self_conditioning_prob,
         )
         pred_dict.update(
             {
