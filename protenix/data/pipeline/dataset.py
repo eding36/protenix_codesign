@@ -375,11 +375,24 @@ class BaseSingleDataset(Dataset):
             entity1 = sample_indice.entity_1_id
             entity2 = sample_indice.entity_2_id
             chain_pairs = entity_pair_to_chain_pairs.get((entity1, entity2))
-            chain1, chain2 = random.choice(chain_pairs)
-            new_sample_indice = deepcopy(sample_indice)
-            new_sample_indice["chain_1_id"] = chain1
-            new_sample_indice["chain_2_id"] = chain2
-            return new_sample_indice, bioassembly_dict, bioassembly_dict_fpath
+            if chain_pairs:
+                present = set(np.unique(bioassembly_dict["atom_array"].chain_id).tolist())
+                usable = [
+                    cp for cp in chain_pairs if all(str(c) in present for c in cp)
+                ]
+                if usable:
+                    chain_pairs = usable
+                else:
+                    # No surviving pair: fall back to the CSV's own ids, which are
+                    # written after dedup and therefore consistent with atom_array.
+                    chain_pairs = None
+            if chain_pairs:
+                chain1, chain2 = random.choice(chain_pairs)
+                new_sample_indice = deepcopy(sample_indice)
+                new_sample_indice["chain_1_id"] = chain1
+                new_sample_indice["chain_2_id"] = chain2
+                return new_sample_indice, bioassembly_dict, bioassembly_dict_fpath
+            return sample_indice, bioassembly_dict, bioassembly_dict_fpath
         else:
             return sample_indice, bioassembly_dict, bioassembly_dict_fpath
 
