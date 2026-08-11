@@ -265,17 +265,39 @@ def _splice_restype_slice(s_inputs, masked_seq, offset, width):
     )
 
 
-def _seed_sequence(cdr_corrupter, gt_ids, cdr_mask, noise_type):
-    """Seed the noised sequence at the maximum timestep (CDRs fully corrupted)."""
-    seq = gt_ids.unsqueeze(0)  # [1, N_token]
+def _seed_sequence(cdr_corrupter, gt_ids, cdr_mask, noise_type, n_sample: int = 1):
+    """Seed the noised sequence at the maximum timestep (CDRs fully corrupted).
+
+    Returns ``[n_sample, N_token]``: one independently seeded sequence per diffusion
+    sample, so N_sample structures yield N_sample DESIGNS rather than one shared
+    sequence. Each row is corrupted independently, which matters for
+    discrete_uniform (a per-row categorical draw); for discrete_absorb the seed is
+    fully masked and therefore identical across rows -- the rollout diverges later,
+    once each row conditions on its own structure and its own sampled tokens.
+    """
+    seq = gt_ids.unsqueeze(0).expand(n_sample, -1)  # [n_sample, N_token]
     cdr = cdr_mask.unsqueeze(0)
     t = torch.full(
         (1,), cdr_corrupter.timesteps - 1, device=gt_ids.device, dtype=torch.long
     )
     res = cdr_corrupter(seq, t, cdr)
     if noise_type == "discrete_absorb":
-        return res[0].squeeze(0)  # [N_token] ids (UNK at CDRs)
-    return Categorical(probs=res).sample().squeeze(0)  #sample from Categorical distribution at each corrupted residue
+        return res[0]  # [n_sample, N_token] ids (UNK at CDRs)
+    return Categorical(probs=res).sample()
+
+
+def _per_sample_logits(k_denoised: torch.Tensor, noise_type: str) -> torch.Tensor:
+    """Sequence logits for the rollout, one row per diffusion sample.
+
+    ``k_denoised`` is ``[..., N_sample, N_token, vocab]``. discrete_absorb keeps the
+    sample dim so each structure designs its own sequence; discrete_uniform still
+    averages, since its posterior step is written for a single row.
+    """
+    while k_denoised.dim() > 3:          # drop any leading batch dims
+        k_denoised = k_denoised[0]
+    if noise_type != "discrete_absorb":
+        return k_denoised.mean(dim=-3) if k_denoised.dim() >= 3 else k_denoised
+    return k_denoised
 
 
 def _sequence_reverse_step(
@@ -294,19 +316,22 @@ def _sequence_reverse_step(
 
     """
     device = seq_noisy.device
-    cdr = cdr_mask.unsqueeze(0).to(torch.bool)  # [1, N_token]
+    cdr = cdr_mask.unsqueeze(0).to(torch.bool)  # [1, N_token], broadcasts over samples
     gt = gt_ids.unsqueeze(0)
     if noise_type == "discrete_absorb":
+        # seq_logits: [N_sample, N_token, vocab] -> denoised ids [N_sample, N_token].
+        # No unsqueeze: the sample dim IS the batch dim the corrupter expects, so
+        # every diffusion sample carries its own sequence through the rollout.
         denoised = (
-            Categorical(logits=seq_logits * temperature).sample() # for each residue, sample from a distribution of model predicted logits
+            Categorical(logits=seq_logits * temperature).sample()
             if sample
-            else seq_logits.argmax(dim=-1) #seq_logits condensed into token indices
-        ).unsqueeze(0)
+            else seq_logits.argmax(dim=-1)
+        )
         tm1 = torch.full((1,), t_seq - 1, device=device, dtype=torch.long)
         seq_new = cdr_corrupter(denoised, tm1, cdr)[0] #corrupt fully denoised seq to t-1
         # Outside the design mask nothing is ever corrupted, so the framework /
         # antigen are simply pinned to ground truth.
-        return torch.where(cdr, seq_new, gt).squeeze(0)
+        return torch.where(cdr, seq_new, gt)
     # discrete_uniform: x0 distribution over the 20 AA slots, D3PM posterior to t-1.
     probs = seq_logits.new_zeros(seq_logits.shape[0], cdr_corrupter.n_tokens) #[N_tokens, 32]
     probs[:, 0:20] = torch.softmax(seq_logits * temperature, dim=-1) #only fill the first 20 columns with logits, since the sequence prediction head only predicts the 20 AAs
@@ -477,7 +502,15 @@ def sample_diffusion(
             )
             gt_ids = input_feature_dict["seq"]
             cdr_mask = input_feature_dict["cdr_mask"]
-            seq_noisy = _seed_sequence(cdr_corrupter, gt_ids, cdr_mask, noise_type) #seq with fully noised CDR region 
+            # One seeded sequence per diffusion sample: N_sample structures ->
+            # N_sample designs. discrete_uniform keeps the old single-sequence path
+            # (its posterior helper is written for one row).
+            n_seq = chunk_n_sample if noise_type == "discrete_absorb" else 1
+            seq_noisy = _seed_sequence(
+                cdr_corrupter, gt_ids, cdr_mask, noise_type, n_sample=n_seq
+            )
+            if noise_type != "discrete_absorb":
+                seq_noisy = seq_noisy.squeeze(0)
 
         for step_i, (c_tau_last, c_tau) in enumerate( #iterative denoising loop
             zip(noise_schedule[:-1], noise_schedule[1:])
@@ -575,7 +608,10 @@ def sample_diffusion(
             # Sequence reverse step (t -> t-1), skipped on the final step (decode).
             if seq_rollout and k_denoised is not None:
                 # fetch model denoised pred logits at t_hat
-                seq_logits = k_denoised.mean(dim=-3) if k_denoised.dim() >= 3 else k_denoised
+                # Keep the per-sample logits: each diffusion sample rolls out its own
+                # sequence. Averaging here (the previous behaviour) collapsed
+                # N_sample structures onto ONE design.
+                seq_logits = _per_sample_logits(k_denoised, noise_type)
                 # One coordinate step == one sequence step (N == T is asserted), so
                 # the sequence timestep descends T-1 -> 0 exactly (MFDesign's
                 # seq_timesteps = range(T)[::-1]).
@@ -596,7 +632,7 @@ def sample_diffusion(
 
         if seq_rollout and k_denoised is not None: #at final time step t_0, decode sequence logits -> final designed CDR sequence
             # Final decode: designed residues from the last logits, framework from GT.
-            seq_logits = k_denoised.mean(dim=-3) if k_denoised.dim() >= 3 else k_denoised
+            seq_logits = _per_sample_logits(k_denoised, noise_type)
             seq_ids = decode_sequence(
                 seq_logits, cdr_mask, gt_ids,
                 temperature=seq_temperature, sample=seq_sample,
