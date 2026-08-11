@@ -611,7 +611,7 @@ class Protenix(nn.Module):
         # any atom without a ground-truth coordinate; everything else is replaced each
         # step by the rigid-aligned ground truth. Off unless
         # eval_structure_inpainting is set.
-        inpaint_coords = inpaint_gen_mask = None
+        inpaint_coords = inpaint_gen_mask = inpaint_align_weight = None
         if (
             getattr(self.configs, "eval_structure_inpainting", False)
             and label_dict is not None
@@ -626,12 +626,20 @@ class Protenix(nn.Module):
                     gen = gen | ~cmask.reshape(-1).bool()
                 inpaint_coords = label_dict["coordinate"]
                 inpaint_gen_mask = gen
+                # MFDesign weights the superposition by every RESOLVED atom
+                # (atom_pad_mask * atom_resolved_mask), CDR included.
+                inpaint_align_weight = (
+                    cmask.reshape(-1).to(inpaint_coords.dtype)
+                    if cmask is not None
+                    else None
+                )
 
         pred_dict["coordinate"], seq_denoised = self.sample_diffusion(
             denoise_net=self.diffusion_module,
             input_feature_dict=input_feature_dict,
             inpaint_coords=inpaint_coords,
             inpaint_gen_mask=inpaint_gen_mask,
+            inpaint_align_weight=inpaint_align_weight,
             s_inputs=s_inputs,
             s_trunk=s,
             z_trunk=None if cache["pair_z"] is not None else z,
