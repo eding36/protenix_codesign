@@ -14,7 +14,11 @@ This script then, for every predicted structure independently:
      CDR-H3 residues.
 
 Results are written per structure, so downstream you can aggregate however you
-like (mean over the N samples, best-of-N, distribution) without re-running.
+like without re-running. The summary prints three per-target aggregates:
+RANK0 (sample 0 -- the eval sorts designs by model confidence before writing, so
+this is MFDesign's protocol and the number to compare against them), mean over
+the N samples, and best-of-N (an oracle upper bound, since it selects using the
+ground truth).
 
 Usage:
     python scripts/cdr_rmsd_benchmark.py \\
@@ -243,12 +247,41 @@ def main() -> None:
         w.writerows(rows)
 
     print(f"\nwrote {len(rows)} rows -> {args.out_csv}")
-    print(f"{'metric':<16}{'mean':>9}{'median':>9}{'n':>6}")
+
+    # Three per-target summaries, matching the three AAR numbers the eval reports.
+    #
+    #   RANK0  sample 0. The eval sorts designs by the model's confidence before
+    #          writing them, so sample 0 is the highest-confidence design -- this is
+    #          MFDesign's protocol (writer.py ranks by confidence_score,
+    #          eval_codesign.py scores rank 0). Use THIS to compare against them.
+    #   MEAN   average over the N samples of a target; no selection.
+    #   BEST   minimum over the N samples. An ORACLE -- it picks using the answer,
+    #          so it is an upper bound, not a protocol.
+    by_target: "dict[str, dict[str, list]]" = {}
+    for r in rows:
+        by_target.setdefault(r["pdb_id"], {}).setdefault(int(r["sample"]), r)
+
+    print(f"{'metric':<16}{'RANK0':>9}{'mean':>9}{'best':>9}{'n_tgt':>7}")
+    print("-" * 50)
     for k in keys:
         if not k.startswith("rmsd"):
             continue
-        vals = np.array([r[k] for r in rows if k in r], dtype=float)
-        print(f"{k:<16}{vals.mean():>9.3f}{np.median(vals):>9.3f}{len(vals):>6}")
+        r0, mn, bs = [], [], []
+        for _pid, samples in by_target.items():
+            vals = [s[k] for s in samples.values() if k in s]
+            if not vals:
+                continue
+            if 0 in samples and k in samples[0]:
+                r0.append(float(samples[0][k]))
+            mn.append(float(np.mean(vals)))
+            bs.append(float(np.min(vals)))
+        if not mn:
+            continue
+        r0v = np.mean(r0) if r0 else float("nan")
+        print(f"{k:<16}{r0v:>9.3f}{np.mean(mn):>9.3f}{np.mean(bs):>9.3f}{len(mn):>7}")
+    n_s = {len(v) for v in by_target.values()}
+    print(f"\nsamples per target: {sorted(n_s)}"
+          + ("   (RANK0 == mean == best with 1 sample)" if n_s == {1} else ""))
 
 
 if __name__ == "__main__":

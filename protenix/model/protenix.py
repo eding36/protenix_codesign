@@ -688,6 +688,50 @@ class Protenix(nn.Module):
             chunk_size=chunk_size,
         )
 
+        # ---- rank the designs by model confidence (MFDesign parity) -----------
+        # MFDesign's writer.py sorts the N diffusion samples by confidence_score
+        # (descending) and eval_codesign.py scores rank 0. Reorder here so index 0
+        # IS rank 0 for every downstream consumer -- the loss, the dumper and the
+        # written structures all agree on the ranking.
+        #
+        # Confidence = expected pLDDT over the DESIGNED atoms (the CDR), which is
+        # what the ranking is meant to discriminate; falls back to all atoms when
+        # no design mask is available. Protenix has no single confidence_score
+        # scalar the way Boltz does, so this is the closest analogue.
+        if self.sequence_train and pred_dict.get("sequence") is not None:
+            plddt_logits = pred_dict.get("plddt")
+            seq_out = pred_dict["sequence"]
+            n_design = seq_out.shape[0] if seq_out.dim() >= 2 else 1
+            if plddt_logits is not None and n_design > 1:
+                with torch.no_grad():
+                    nb = plddt_logits.shape[-1]
+                    centers = torch.linspace(
+                        0.0, 1.0, nb, device=plddt_logits.device,
+                        dtype=torch.float32,
+                    )
+                    exp_plddt = (
+                        plddt_logits.float().softmax(dim=-1) * centers
+                    ).sum(dim=-1)                      # [..., N_sample, N_atom]
+                    while exp_plddt.dim() > 2:         # drop leading batch dims
+                        exp_plddt = exp_plddt[0]
+                    w = None
+                    cdr_tok = input_feature_dict.get("cdr_mask")
+                    if cdr_tok is not None and "atom_to_token_idx" in input_feature_dict:
+                        a2t = input_feature_dict["atom_to_token_idx"].reshape(-1).long()
+                        w = cdr_tok.reshape(-1).bool()[a2t]
+                        if not bool(w.any()):
+                            w = None
+                    score = (
+                        exp_plddt[..., w].mean(dim=-1)
+                        if w is not None
+                        else exp_plddt.mean(dim=-1)
+                    )                                   # [N_sample]
+                    order = torch.argsort(score, descending=True)
+                pred_dict["confidence_score"] = score[order]
+                pred_dict["sequence"] = seq_out[order]
+                if pred_dict["coordinate"].shape[-3] == n_design:
+                    pred_dict["coordinate"] = pred_dict["coordinate"][..., order, :, :]
+
         step_confidence = time.time()
         time_tracker.update({"confidence": step_confidence - step_diffusion})
         time_tracker.update({"model_forward": time.time() - step_st})
