@@ -42,7 +42,7 @@ N_SAMPLE="${N_SAMPLE:-20}"   # 20 designs per target, matching MFDesign predict.
 INPAINT="${INPAINT:-true}"   # replacement sampling (MFDesign --structure_inpainting)
 # MAX_TOKEN="${MAX_TOKEN:-3840}"
 MAX_TOKEN="3840"
-RUN_DIR="${RUN_DIR:-./output/protenix_antibody_codesign_stage_4_20260802_140148}"
+RUN_DIR="${RUN_DIR:-./output/protenix_antibody_codesign_stage_4_angular_diffusion_20260811_101834/}"
 CKPT="${CKPT:-${RUN_DIR}/checkpoints/stage_4.pt}"
 RUN_NAME="${RUN_NAME:-protenix_codesign_fulltest}"
 # Pin the interpreter: under nohup/cron the conda env is usually NOT activated,
