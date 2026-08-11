@@ -321,7 +321,10 @@ def _sequence_reverse_step(
 
 
 def _replace_fixed_atoms(
-    x: torch.Tensor, x_gt: torch.Tensor, gen_mask: torch.Tensor
+    x: torch.Tensor,
+    x_gt: torch.Tensor,
+    gen_mask: torch.Tensor,
+    align_weight: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Rigid-align the ground truth onto ``x`` and substitute the fixed atoms.
 
@@ -329,12 +332,18 @@ def _replace_fixed_atoms(
     the model is allowed to generate (the CDR atoms, plus any atom with no
     ground-truth coordinate); everything else is taken from the aligned reference.
 
-    The alignment is weighted onto the *fixed* atoms, since those are the ones being
-    substituted -- aligning on the generated region would drag the framework.
+    ``align_weight`` is the per-atom weight for the superposition. MFDesign uses
+    ``atom_pad_mask * atom_resolved_mask`` -- i.e. EVERY resolved atom, including
+    the CDR it is about to overwrite -- so pass the resolved mask to match it.
+    Falls back to the fixed atoms only when not given.
     """
     from protenix.metrics.rmsd import weighted_rigid_align
 
-    fixed_w = (~gen_mask).to(x.dtype)
+    fixed_w = (
+        align_weight.to(x.dtype)
+        if align_weight is not None
+        else (~gen_mask).to(x.dtype)
+    )
     if float(fixed_w.sum()) == 0:
         return x
     # Kabsch alignment goes through SVD, which CUDA does not implement for bf16
@@ -381,6 +390,7 @@ def sample_diffusion(
     seq_sample: bool = True,
     inpaint_coords: Optional[torch.Tensor] = None,
     inpaint_gen_mask: Optional[torch.Tensor] = None,
+    inpaint_align_weight: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Implements Algorithm 18 in AF3.
     It performances denoising steps from time 0 to time T.
@@ -554,7 +564,8 @@ def sample_diffusion(
                 # an explicit re-noising term.
                 if inpaint_coords is not None:
                     x_denoised = _replace_fixed_atoms(
-                        x_denoised, inpaint_coords, inpaint_gen_mask
+                        x_denoised, inpaint_coords, inpaint_gen_mask,
+                        inpaint_align_weight,
                     )
 
                 delta = (x_noisy - x_denoised) / t_hat[
@@ -581,7 +592,9 @@ def sample_diffusion(
         # Alg. S3 lines 23-24: final replacement so the returned structure carries
         # the native framework exactly, not merely a well-aligned approximation.
         if inpaint_coords is not None:
-            x_l = _replace_fixed_atoms(x_l, inpaint_coords, inpaint_gen_mask)
+            x_l = _replace_fixed_atoms(
+                x_l, inpaint_coords, inpaint_gen_mask, inpaint_align_weight
+            )
 
         if seq_rollout and k_denoised is not None: #at final time step t_0, decode sequence logits -> final designed CDR sequence
             # Final decode: designed residues from the last logits, framework from GT.
