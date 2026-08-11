@@ -1598,6 +1598,27 @@ class SequenceLoss(nn.Module):
             mask = mask.expand_as(pred_ids)
             valid_mask = (gt >= self._AA_MIN) & (gt <= self._AA_MAX) & mask.bool()
             if valid_mask.any():
+                # BEST-OF-N over the diffusion samples. With N_sample > 1 each design
+                # is scored on its own and the best is reported, rather than averaging
+                # them into a number no single design achieves.
+                #
+                # NOTE this is NOT comparable to MFDesign's published AAR: their
+                # eval_codesign.py scores rank 0 only, even though predict.py runs
+                # --diffusion_samples 20. Quote best-of-N as its own number.
+                correct = (pred_ids == gt) & valid_mask
+                if pred_ids.dim() >= 2 and pred_ids.shape[0] > 1:
+                    flat_c = correct.reshape(pred_ids.shape[0], -1).sum(dim=-1)
+                    flat_n = valid_mask.reshape(pred_ids.shape[0], -1).sum(dim=-1)
+                    per_design = flat_c.float() / flat_n.clamp(min=1).float()
+                    seq_acc = per_design.max()
+                    metrics = {
+                        "seq_acc": seq_acc,                  # best design
+                        "seq_acc_mean": per_design.mean(),   # average design
+                        "seq_acc_n_designs": torch.tensor(
+                            float(pred_ids.shape[0]), device=pred_ids.device
+                        ),
+                    }
+                    return pred_ids.new_zeros(()).float(), metrics
                 seq_acc = (pred_ids[valid_mask] == gt[valid_mask]).float().mean()
             else:
                 seq_acc = pred_ids.new_zeros(()).float()

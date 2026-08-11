@@ -3,7 +3,14 @@
 #
 # Runs runner/train.py in --eval_only mode over the ENTIRE antibody codesign test
 # set, with replacement sampling (structural inpainting at every denoising step)
-# and N_sample diffusion samples per target. Dumps, per target:
+# and N_sample diffusion samples per target. Each sample now rolls out its OWN
+# sequence, so N_SAMPLE=20 yields 20 DISTINCT designs per target -- previously the
+# per-sample logits were averaged and 20 structures collapsed onto 1 sequence.
+# AAR is reported best-of-N (seq_acc), with the average also logged as
+# seq_acc_mean. NOTE best-of-N is NOT comparable to MFDesign's published AAR:
+# their predict.py runs --diffusion_samples 20 but eval_codesign.py scores rank 0
+# only. Quote best-of-N as its own number, or compare using seq_acc_mean.
+# Dumps, per target:
 #   structures/<test_set>_step0_raw/<pid>_sample{0..N-1}.cif   predicted
 #   structures/<test_set>_step0_raw/<pid>_native.cif           ground truth
 #   structures/<test_set>_step0_raw/<pid>_regions.json         CDR/framework map
@@ -21,8 +28,7 @@
 #
 # Usage:
 #   bash antibody_codesign_full_eval.sh
-#   N_SAMPLE=1 bash antibody_codesign_full_eval.sh    # ~4-5h, matches MFDesign's
-#                                                     # single-sample protocol
+#   N_SAMPLE=1 bash antibody_codesign_full_eval.sh    # ~4-5h, one design per target
 #   GPU=1 CKPT=/path/to/ckpt.pt bash antibody_codesign_full_eval.sh
 set -euo pipefail
 cd /home/dinge/Protenix
@@ -32,8 +38,8 @@ cd /home/dinge/Protenix
 # functions are no longer rank-gated (each rank writes its own disjoint shard).
 GPU="${GPU:-0,1}"
 NPROC="$(awk -F, '{print NF}' <<< "${GPU}")"
-N_SAMPLE="${N_SAMPLE:-20}"
-INPAINT="${INPAINT:-true}"
+N_SAMPLE="${N_SAMPLE:-20}"   # 20 designs per target, matching MFDesign predict.py
+INPAINT="${INPAINT:-true}"   # replacement sampling (MFDesign --structure_inpainting)
 # MAX_TOKEN="${MAX_TOKEN:-3840}"
 MAX_TOKEN="2048"
 RUN_DIR="${RUN_DIR:-./output/protenix_antibody_codesign_stage_4_20260802_140148}"
