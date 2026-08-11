@@ -41,7 +41,7 @@ NPROC="$(awk -F, '{print NF}' <<< "${GPU}")"
 N_SAMPLE="${N_SAMPLE:-20}"   # 20 designs per target, matching MFDesign predict.py
 INPAINT="${INPAINT:-true}"   # replacement sampling (MFDesign --structure_inpainting)
 # MAX_TOKEN="${MAX_TOKEN:-3840}"
-MAX_TOKEN="2048"
+MAX_TOKEN="3840"
 RUN_DIR="${RUN_DIR:-./output/protenix_antibody_codesign_stage_4_20260802_140148}"
 CKPT="${CKPT:-${RUN_DIR}/checkpoints/stage_4.pt}"
 RUN_NAME="${RUN_NAME:-protenix_codesign_fulltest}"
@@ -165,10 +165,28 @@ if (( NPROC > 1 )); then
   echo "(structures are per-PDB and need no merging)."
   echo
 fi
-echo "Now compute CDR RMSD offline (geometry only, fast):"
-echo "    python scripts/cdr_rmsd_benchmark.py \\"
-echo "        --pred_dir ${PRED_DIR} \\"
-echo "        --out_csv  cdr_rmsd_${STAMP}.csv --no_relax"
+# ---- CDR RMSD (automatic) -----------------------------------------------------
+# Runs here so a 2-3 day eval yields BOTH numbers without a second manual step.
+# Geometry only, no GPU, minutes. Non-fatal: a failure here must not obscure the
+# eval that just finished, so the command is echoed for a manual retry.
+RMSD_CSV="${OUT}/cdr_rmsd_${STAMP}.csv"
+if [[ -d "${PRED_DIR}" ]]; then
+  echo "Computing CDR RMSD -> ${RMSD_CSV}"
+  if "${PYBIN:-/home/dinge/miniconda3/envs/protenix/bin/python}" \
+        scripts/cdr_rmsd_benchmark.py \
+        --pred_dir "${PRED_DIR}" \
+        --out_csv  "${RMSD_CSV}" --no_relax; then
+    echo "CDR RMSD written to ${RMSD_CSV}"
+    echo "RANK0 is the MFDesign-comparable column (designs are confidence-sorted,"
+    echo "so sample 0 is the highest-confidence design)."
+  else
+    echo "[warn] CDR RMSD failed; the eval itself is unaffected. Retry with:"
+    echo "    python scripts/cdr_rmsd_benchmark.py --pred_dir ${PRED_DIR} \\"
+    echo "        --out_csv ${RMSD_CSV} --no_relax"
+  fi
+else
+  echo "[warn] no structures at ${PRED_DIR}; skipping CDR RMSD."
+fi
 echo
 echo "NOTE: the --relax path uses an UNCONSTRAINED FastRelax, which measurably"
 echo "      WORSENS Ca RMSD (H3 6.11 -> 7.42 A on the structures tested) because"
