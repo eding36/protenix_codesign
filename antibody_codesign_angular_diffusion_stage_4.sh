@@ -25,7 +25,7 @@ export LAYERNORM_TYPE=torch
 # Specify your data root directory by uncommenting the following line.
 export PROTENIX_ROOT_DIR="/home/dinge/data/proj/protenix_codesign/data"
 # wget -P $PROTENIX_ROOT_DIR/checkpoint/ https://protenix.tos-cn-beijing.volces.com/checkpoint/protenix_base_default_v1.0.0.pt
-checkpoint_path="/home/dinge/Protenix/output/protenix_antibody_codesign_stage_3_angular_diffusion_20260730_111338/checkpoints/stage_3.pt"
+checkpoint_path="/home/dinge/Protenix/output/protenix_antibody_codesign_stage_3_angular_diffusion_20260809_115526/checkpoints/stage_3.pt"
 # NOTE: torsion_noise_prob is CONDITIONAL on sigma <= torsion_sigma_max.
 # With the 2.0 A gate P(sigma<=2)=27.9%, so 0.7 => ~20% of steps actually use
 # torsion noise (0.4 would give only 11%). Ceiling is 27.9% at this gate.
@@ -67,6 +67,6 @@ torchrun --standalone --nproc_per_node=2 /home/dinge/Protenix/runner/train.py \
 --antibody_min_neighborhood 0 \
 --antibody_max_neighborhood 40 \
 --antibody_mixed_prob 0.5 \
---torsion_noise_prob 0.7 \
+--torsion_noise_prob 0.0 \
 --torsion_sigma_max 2.0 \
---loss.weight.alpha_chi 0.5
+--loss.weight.alpha_chi 0.0
