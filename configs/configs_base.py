@@ -50,7 +50,7 @@ basic_configs = {
     # sampled decode is not comparable to it and compounds over 200 steps.
     "seq_sample": True,
     "seq_temperature": 1.0,
-    # Shapes the sequence timestep distribution. seq_t = floor(T * u**power), u~U(0,1).
+    # seq_timestep_power shapes the sequence timestep distribution. seq_t = floor(T * u**power), u~U(0,1).
     # 1.0 = uniform (original). <1.0 shifts mass toward FULLY MASKED CDRs.
     # NOTE: seq_t is coupled to structure noise (sigma = schedule[T-1-seq_t]), so
     # lowering this also shifts structure training toward high sigma -- which makes
