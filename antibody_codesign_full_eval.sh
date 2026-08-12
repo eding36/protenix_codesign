@@ -135,6 +135,7 @@ CUDA_VISIBLE_DEVICES="${GPU}" "${TORCHRUN}" --standalone --nproc_per_node="${NPR
   --sample_diffusion.N_step 200 \
   --sample_diffusion.N_sample "${N_SAMPLE}" \
   --model.diffusion_module.sequence_noise_type "${SEQ_NOISE}" \
+  --infer_setting.sample_diffusion_chunk_size 2 \
   --skip_amp.sample_diffusion false \
   --triangle_attention "cuequivariance" \
   --triangle_multiplicative "cuequivariance" \
