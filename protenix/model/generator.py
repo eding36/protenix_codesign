@@ -596,12 +596,14 @@ def sample_diffusion(
 
         if seq_rollout and k_denoised is not None: #at final time step t_0, decode sequence logits -> final designed CDR sequence
             # Final decode: designed residues from the last logits, framework from GT.
-            seq_logits = k_denoised.mean(dim=-3) if k_denoised.dim() >= 3 else k_denoised
+            seq_logits = k_denoised
+            while seq_logits.dim() > 3:      # drop leading batch dims, keep N_sample
+                seq_logits = seq_logits[0]
             seq_ids = decode_sequence(
                 seq_logits, cdr_mask, gt_ids,
                 temperature=seq_temperature, sample=seq_sample,
             )
-            return x_l, seq_ids  # k slot now carries decoded token ids [N_token]
+            return x_l, seq_ids  # [N_sample, N_token] decoded ids (one design each)
 
         return x_l, k_denoised
 
@@ -628,10 +630,17 @@ def sample_diffusion(
         # k is None for non-sequence models; only aggregate real predictions.
         if not all(k is not None for k in k_chunks):
             k_denoised = None
-        elif k_chunks[0].dim() == 1:
-            # Sequence rollout: each chunk yields one decoded sequence [N_token];
-            # stack into [n_chunks, N_token] (one design per chunk).
-            k_denoised = torch.stack(k_chunks, dim=0)
+        elif not k_chunks[0].is_floating_point():
+            # Sequence rollout: chunks carry DECODED ids, not logits.
+            #   [N_token]                 -> one design per chunk (stack)
+            #   [chunk_n_sample, N_token] -> per-sample decode (concatenate)
+            # Getting this wrong sends 2-D ids into torch.cat(..., -3), which has no
+            # such dim.
+            k_denoised = (
+                torch.stack(k_chunks, dim=0)
+                if k_chunks[0].dim() == 1
+                else torch.cat(k_chunks, dim=0)
+            )
         else:
             k_denoised = torch.cat(k_chunks, -3)  # per-sample logits
     return x_l, k_denoised
