@@ -62,6 +62,7 @@ class DataPipeline(object):
         sabdab_roles: Union[dict, None] = None,
         skip_assembly_expansion: bool = False,
         assembly_id: str = "1",
+        mfdesign_chain_subset: bool = False,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """
         Get raw data from mmcif with tokenizer and a list of chains and interfaces for sampling.
@@ -115,6 +116,40 @@ class DataPipeline(object):
                 bioassembly_dict["atom_array"] = DataPipeline.keep_one_assembly_copy(
                     bioassembly_dict["atom_array"]
                 )
+
+            # MFDesign parity for the TEST split: evaluate exactly the chains their
+            # benchmark does -- heavy, light and each antigen author id, one chain per
+            # role -- and nothing else. The crystallographic assembly carries far more:
+            # 7xic has 61 chains and 994 glycan atoms, and glycans are ATOMISED (one
+            # token per heavy atom), so the same complex is 5506 tokens here against
+            # ~1233 residues in their YAML.
+            #
+            # Applied before tokenization so the token array and every downstream
+            # annotation are built from the trimmed structure. Unresolved residues are
+            # deliberately preserved: MFDesign predicts its full curated sequence and
+            # masks unresolved atoms at scoring time (atom_resolved_mask), which is what
+            # coordinate_mask does here -- dropping them would make the task easier than
+            # theirs and would silently break the chi, side-chain RMSD and inpainting
+            # masks, all of which key off it.
+            if mfdesign_chain_subset and sabdab_roles:
+                entries_t = sabdab_roles.get(str(bioassembly_dict["pdb_id"]).lower())
+                if entries_t:
+                    aa_t = bioassembly_dict["atom_array"]
+                    h_t, l_t, ag_t = resolve_sabdab_roles(aa_t, entries_t)
+                    keep_asym = list(dict.fromkeys([*h_t, *l_t, *ag_t]))
+                    if keep_asym:
+                        mask_t = np.isin(aa_t.asym_id_int, keep_asym)
+                        if mask_t.any():
+                            trimmed = aa_t[mask_t]
+                            bioassembly_dict["atom_array"] = trimmed
+                            # num_tokens is stamped by get_bioassembly() BEFORE this
+                            # trim (parser.py: centre_atom_mask.sum()) and copied
+                            # verbatim into every indices row, so it must be recomputed
+                            # here -- otherwise test_max_n_token filters on the
+                            # untrimmed size and skips structures that now fit.
+                            bioassembly_dict["num_tokens"] = int(
+                                trimmed.centre_atom_mask.sum()
+                            )
 
             sample_indices_list = parser.make_indices(
                 bioassembly_dict=bioassembly_dict,
