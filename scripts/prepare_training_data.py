@@ -566,6 +566,7 @@ def run_gen_data(
     complexes_json: Optional[Path] = None,
     cif_output_dir: Optional[Path] = None,
     one_row_per_complex: bool = False,
+    mfdesign_chain_subset: bool = False,
 ):
     """
     Generates data from MMCIF files and saves the output to specified locations.
@@ -629,6 +630,7 @@ def run_gen_data(
             strip_antibody_cdr,
             cif_output_dir,
             one_row_per_complex=dedup,
+            mfdesign_chain_subset=mfdesign_chain_subset,
         )
         return
 
@@ -772,6 +774,17 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--mfdesign_chain_subset",
+        action="store_true",
+        help=(
+            "Trim each structure to its H/L/antigen chains before tokenization, so "
+            "the token count matches MFDesign's benchmark. The crystallographic "
+            "assembly carries chains their YAML never sees, and glycans are atomised "
+            "one token per heavy atom. Intended for the TEST split."
+        ),
+    )
+
+    parser.add_argument(
         "--cif_output_dir",
         type=Path,
         default=None,
@@ -799,4 +812,5 @@ if __name__ == "__main__":
         complexes_json=args.complexes_json,
         cif_output_dir=args.cif_output_dir,
         one_row_per_complex=args.one_row_per_complex,
+        mfdesign_chain_subset=args.mfdesign_chain_subset,
     )
