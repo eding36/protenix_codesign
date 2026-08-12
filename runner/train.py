@@ -702,21 +702,28 @@ class AF3Trainer(object):
             ]
             n_s = len(per_sample)
             n_cdr = min(len(a["per_cdr"]) for a in per_sample)
+            # RANK 0, matching MFDesign and the sequence loss. Designs arrive sorted
+            # by the model's confidence, so per_sample[0] is its own top pick -- a
+            # selection that uses no ground truth. Averaging across designs (the
+            # previous behaviour) reports a number no single design achieves and
+            # disagrees with what loss.py logs.
             aar = {
-                "total": sum(a["total"] for a in per_sample) / n_s,
-                "heavy": sum(a["heavy"] for a in per_sample) / n_s,
-                "light": sum(a["light"] for a in per_sample) / n_s,
-                "per_cdr": [
-                    sum(a["per_cdr"][i] for a in per_sample) / n_s
-                    for i in range(n_cdr)
-                ],
+                "total": per_sample[0]["total"],
+                "heavy": per_sample[0]["heavy"],
+                "light": per_sample[0]["light"],
+                "per_cdr": per_sample[0]["per_cdr"][:n_cdr],
                 "n_designed": per_sample[0]["n_designed"],
             }
-            pred_ids = all_pred[0]  # representative design for the FASTA/.seq dump
+            pred_ids = all_pred[0]  # rank 0 -- highest confidence
             simple_metrics["aar/n_samples"] = float(n_s)
-            simple_metrics["aar/total"] = aar["total"]
+            simple_metrics["aar/total"] = aar["total"]          # rank 0
             simple_metrics["aar/heavy"] = aar["heavy"]
             simple_metrics["aar/light"] = aar["light"]
+            # No-selection baseline and oracle bound, for context.
+            simple_metrics["aar/total_mean"] = sum(
+                a["total"] for a in per_sample
+            ) / n_s
+            simple_metrics["aar/total_best"] = max(a["total"] for a in per_sample)
             # Name the loops when the segment count matches the canonical layout
             # (MFDesign's positional convention: first three heavy, last three light).
             per_cdr = aar["per_cdr"]
@@ -740,20 +747,27 @@ class AF3Trainer(object):
             shard = (
                 f"_rank{DIST_WRAPPER.rank}" if DIST_WRAPPER.world_size > 1 else ""
             )
-            letters = token_ids_to_letters(pred_ids)
-            per_cdr_str = "\t".join(f"{v:.3f}" for v in per_cdr)
             fasta_path = os.path.join(self.prediction_dir, f"{tag}{shard}.fasta")
             seq_path = os.path.join(self.prediction_dir, f"{tag}{shard}.seq")
+            # One row per design, rank 0 first (designs are confidence-sorted).
+            # The Rank column is new: rank 0 is the reported number, the rest give
+            # the spread. Downstream parsers must read by header name, not position.
             if not os.path.exists(seq_path):
                 with open(seq_path, "w") as f:
-                    f.write("PDB\tSequence\tTotal\tH\tL\tN_designed\tPerCDR\n")
-            with open(fasta_path, "a") as f:
-                f.write(f">{pid}\n{letters}\n")
-            with open(seq_path, "a") as f:
-                f.write(
-                    f"{pid}\t{letters}\t{aar['total']:.3f}\t{aar['heavy']:.3f}\t"
-                    f"{aar['light']:.3f}\t{aar['n_designed']}\t{per_cdr_str}\n"
-                )
+                    f.write(
+                        "PDB\tRank\tSequence\tTotal\tH\tL\tN_designed\tPerCDR\n"
+                    )
+            with open(fasta_path, "a") as f, open(seq_path, "a") as fs:
+                for rank in range(all_pred.shape[0]):
+                    letters_r = token_ids_to_letters(all_pred[rank])
+                    a = per_sample[rank]
+                    pc = "\t".join(f"{v:.3f}" for v in a["per_cdr"][:n_cdr])
+                    f.write(f">{pid}|rank{rank}\n{letters_r}\n")
+                    fs.write(
+                        f"{pid}\t{rank}\t{letters_r}\t{a['total']:.3f}\t"
+                        f"{a['heavy']:.3f}\t{a['light']:.3f}\t"
+                        f"{a['n_designed']}\t{pc}\n"
+                    )
         except Exception as e:  # noqa: BLE001 - never break an eval pass
             logging.warning("Sequence-design logging failed: %s", e)
 
