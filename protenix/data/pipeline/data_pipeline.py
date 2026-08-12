@@ -25,11 +25,13 @@ import torch
 from biotite.structure import AtomArray
 
 from protenix.data.antibody_cdr import (
+    _region_labels_from_summary,
     add_chain_and_region_types_to_token_array,
     add_is_cdr_residue_to_token_array,
     resolve_sabdab_roles,
     strip_cdr_side_chains,
 )
+from protenix.data.constants import PRO_STD_RESIDUES, mmcif_restype_3to1
 from protenix.data.core.parser import (
     AddAtomArrayAnnot,
     DistillationMMCIFParser,
@@ -46,6 +48,152 @@ from protenix.utils.logger import get_logger
 logger = get_logger(__name__)
 
 torch.multiprocessing.set_sharing_strategy("file_system")
+
+
+def _pick_role_asyms(atom_array, asym_ids, declared) -> list:
+    """One chain per declared author id, preferring an exact author match.
+
+    resolve_sabdab_roles matches by sequence, so assembly copies all come back
+    (9fve returned 9 copies of its antigen under author ids E/G/I/K/...).
+    """
+    if not asym_ids:
+        return []
+    n = max(1, len(declared))
+    auth_of = {}
+    for asym in asym_ids:
+        sel = atom_array.asym_id_int == asym
+        if sel.any():
+            auth_of[asym] = str(atom_array.auth_asym_id[sel][0])
+    exact = [a for a in asym_ids if auth_of.get(a) in {str(d) for d in declared}]
+    if exact:
+        out, seen = [], set()
+        for a in exact:
+            if auth_of[a] not in seen:
+                seen.add(auth_of[a])
+                out.append(a)
+        return out[:n]
+    # No declared id present (assembly renamed the chains): keep one per
+    # distinct sequence, capped at the number of declared roles.
+    out, seen = [], set()
+    for a in asym_ids:
+        sel = atom_array.asym_id_int == a
+        key = "".join(atom_array.res_name[sel][:400].tolist())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(a)
+        if len(out) >= n:
+            break
+    return out
+
+
+def _chain_seq(atom_array, asym):
+    sel = np.where(atom_array.asym_id_int == asym)[0]
+    if len(sel) == 0:
+        return ""
+    _, first = np.unique(atom_array.res_id[sel], return_index=True)
+    return "".join(
+        mmcif_restype_3to1.get(str(n), "X")
+        for n in atom_array.res_name[sel][np.sort(first)]
+    )
+
+
+def _match_asym_by_seq(atom_array, ref_seq, exclude):
+    """Chain whose sequence best matches ref_seq, or None."""
+    if not ref_seq:
+        return None
+    import difflib
+
+    best, best_score = None, 0.0
+    for asym in np.unique(atom_array.asym_id_int):
+        if asym in exclude:
+            continue
+        seq = _chain_seq(atom_array, asym)
+        if len(seq) < 50:
+            continue
+        if ref_seq in seq:
+            return int(asym)
+        score = difflib.SequenceMatcher(None, ref_seq, seq, autojunk=False).ratio()
+        if score > best_score:
+            best, best_score = int(asym), score
+    return best if best_score >= 0.8 else None
+
+
+def _fallback_antigen_asyms(atom_array, exclude, n):
+    """Largest protein chains that are not the antibody.
+
+    resolve_sabdab_roles maps antigens by author id, which fails when the
+    assembly renames chains (8t1g declares C/D but assembly 1 has A/B).
+    """
+    if n <= 0:
+        return []
+    sizes = []
+    for asym in np.unique(atom_array.asym_id_int):
+        if asym in exclude:
+            continue
+        sel = atom_array.asym_id_int == asym
+        names = atom_array.res_name[sel]
+        if not np.isin(names, list(PRO_STD_RESIDUES.keys())).any():
+            continue
+        n_res = len(np.unique(atom_array.res_id[sel]))
+        if n_res >= 20:
+            sizes.append((n_res, int(asym)))
+    sizes.sort(reverse=True)
+    return [a for _, a in sizes[:n]]
+
+
+def _unresolved_atom_mask(atom_array, asym_ids):
+    """Atoms of residues with no resolved coordinates, on the given chains."""
+    sel = np.isin(atom_array.asym_id_int, asym_ids)
+    drop = np.zeros(len(atom_array), dtype=bool)
+    if not sel.any():
+        return drop
+    unres = np.linalg.norm(atom_array.coord, axis=-1) < 1e-3
+    idx = np.where(sel)[0]
+    key = np.array(
+        [f"{a}_{r}" for a, r in zip(atom_array.asym_id_int[idx], atom_array.res_id[idx])]
+    )
+    for k in np.unique(key):
+        m = idx[key == k]
+        if unres[m].all():
+            drop[m] = True
+    return drop
+
+
+def _non_fv_atom_mask(atom_array, entries, h_asyms, l_asyms):
+    """Atoms of H/L chains outside the curated Fv, or None if nothing maps."""
+    pairs = []
+    for asyms, k in ((h_asyms, "H"), (l_asyms, "L")):
+        for a in asyms:
+            for e in entries:
+                ref, masked = e.get(f"{k}_seq"), e.get(f"{k}_masked")
+                if ref and masked:
+                    pairs.append((int(a), ref, masked))
+                    break
+    if not pairs:
+        return None
+
+    drop = np.zeros(len(atom_array), dtype=bool)
+    hit = False
+    for asym, ref, masked in pairs:
+        sel = np.where(atom_array.asym_id_int == asym)[0]
+        if len(sel) == 0:
+            continue
+        res_ids = atom_array.res_id[sel]
+        _, first = np.unique(res_ids, return_index=True)
+        order = res_ids[np.sort(first)]
+        struct_seq = "".join(
+            mmcif_restype_3to1.get(str(n), "X")
+            for n in atom_array.res_name[sel][np.sort(first)]
+        )
+        labels = _region_labels_from_summary(struct_seq, [(ref, masked)])
+        if labels is None:
+            continue
+        non_fv = order[np.array(labels) == 0]
+        if len(non_fv):
+            drop[sel] |= np.isin(res_ids, non_fv)
+            hit = True
+    return drop if hit else None
 
 
 class DataPipeline(object):
@@ -117,36 +265,48 @@ class DataPipeline(object):
                     bioassembly_dict["atom_array"]
                 )
 
-            # MFDesign parity for the TEST split: evaluate exactly the chains their
-            # benchmark does -- heavy, light and each antigen author id, one chain per
-            # role -- and nothing else. The crystallographic assembly carries far more:
-            # 7xic has 61 chains and 994 glycan atoms, and glycans are ATOMISED (one
-            # token per heavy atom), so the same complex is 5506 tokens here against
-            # ~1233 residues in their YAML.
-            #
-            # Applied before tokenization so the token array and every downstream
-            # annotation are built from the trimmed structure. Unresolved residues are
-            # deliberately preserved: MFDesign predicts its full curated sequence and
-            # masks unresolved atoms at scoring time (atom_resolved_mask), which is what
-            # coordinate_mask does here -- dropping them would make the task easier than
-            # theirs and would silently break the chi, side-chain RMSD and inpainting
-            # masks, all of which key off it.
+            # Match MFDesign's yaml: one chain per role, antibody chains cut to the Fv.
+            # Applied before tokenization so all downstream annotations follow.
             if mfdesign_chain_subset and sabdab_roles:
                 entries_t = sabdab_roles.get(str(bioassembly_dict["pdb_id"]).lower())
                 if entries_t:
                     aa_t = bioassembly_dict["atom_array"]
                     h_t, l_t, ag_t = resolve_sabdab_roles(aa_t, entries_t)
-                    keep_asym = list(dict.fromkeys([*h_t, *l_t, *ag_t]))
+                    e0 = entries_t[0]
+                    h_pick = _pick_role_asyms(
+                        aa_t, h_t, [e0.get("H")] if e0.get("H") else []
+                    )
+                    l_pick = _pick_role_asyms(
+                        aa_t, l_t, [e0.get("L")] if e0.get("L") else []
+                    )
+                    # Author ids break when the assembly renames chains; the
+                    # curated Fv sequence identifies the chain regardless.
+                    if e0.get("H") and not h_pick:
+                        m = _match_asym_by_seq(aa_t, e0.get("H_seq"), set(l_pick))
+                        h_pick = [m] if m is not None else []
+                    if e0.get("L") and not l_pick:
+                        m = _match_asym_by_seq(aa_t, e0.get("L_seq"), set(h_pick))
+                        l_pick = [m] if m is not None else []
+                    ab = h_pick + l_pick
+                    declared_ag = e0.get("antigen") or []
+                    ag_pick = _pick_role_asyms(aa_t, ag_t, declared_ag)
+                    if declared_ag and not ag_pick:
+                        ag_pick = _fallback_antigen_asyms(aa_t, set(ab), len(declared_ag))
+                    keep_asym = list(dict.fromkeys(ab + ag_pick))
                     if keep_asym:
                         mask_t = np.isin(aa_t.asym_id_int, keep_asym)
+                        drop = _non_fv_atom_mask(aa_t, entries_t, h_pick, l_pick)
+                        if drop is not None:
+                            mask_t = mask_t & ~drop
+                        # MFDesign's antigen sequence is taken from the resolved
+                        # structure; the antibody keeps its curated Fv.
+                        if ag_pick:
+                            mask_t = mask_t & ~_unresolved_atom_mask(aa_t, ag_pick)
                         if mask_t.any():
                             trimmed = aa_t[mask_t]
                             bioassembly_dict["atom_array"] = trimmed
-                            # num_tokens is stamped by get_bioassembly() BEFORE this
-                            # trim (parser.py: centre_atom_mask.sum()) and copied
-                            # verbatim into every indices row, so it must be recomputed
-                            # here -- otherwise test_max_n_token filters on the
-                            # untrimmed size and skips structures that now fit.
+                            # parser stamps num_tokens pre-trim; test_max_n_token
+                            # filters on it.
                             bioassembly_dict["num_tokens"] = int(
                                 trimmed.centre_atom_mask.sum()
                             )
