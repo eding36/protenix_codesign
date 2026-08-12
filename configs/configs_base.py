@@ -179,6 +179,9 @@ model_configs = {
         "sample_diffusion_chunk_size": ValueMaybeNone(
             5
         ),  # should set to null for normal training and small dataset eval [for efficiency]
+        # Samples per confidence/summary group; frees pae/pde as it goes so peak
+        # memory stops scaling with N_sample. 0 = all at once.
+        "confidence_stream_size": ValueMaybeNone(0),
         "lddt_metrics_sparse_enable": GlobalConfigValue("loss_metrics_sparse_enable"),
         "lddt_metrics_chunk_size": ValueMaybeNone(
             1
