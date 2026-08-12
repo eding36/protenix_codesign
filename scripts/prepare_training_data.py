@@ -309,6 +309,7 @@ def gen_a_complex_data(
     distillation: bool = False,
     strip_antibody_cdr: bool = True,
     cif_output_dir: Optional[Path] = None,
+    mfdesign_chain_subset: bool = False,
 ) -> Optional[list[dict]]:
     """Generate bioassembly data and processed cif file 
     containing selected H/L/Ag chains for a single antibody-antigen complex. 
@@ -333,6 +334,7 @@ def gen_a_complex_data(
         cluster_file,
         dataset,
         strip_antibody_cdr=strip_antibody_cdr,
+        mfdesign_chain_subset=mfdesign_chain_subset,
         sabdab_roles=sabdab_roles,
     )
 
@@ -365,6 +367,7 @@ def gen_a_complex_data(
                 cluster_file,
                 dataset,
                 strip_antibody_cdr=strip_antibody_cdr,
+        mfdesign_chain_subset=mfdesign_chain_subset,
                 sabdab_roles=sabdab_roles,
                 assembly_id=aid,
             )
@@ -377,6 +380,7 @@ def gen_a_complex_data(
                 cluster_file,
                 dataset,
                 strip_antibody_cdr=strip_antibody_cdr,
+        mfdesign_chain_subset=mfdesign_chain_subset,
                 sabdab_roles=sabdab_roles,
                 skip_assembly_expansion=True,
             )
@@ -459,6 +463,7 @@ def gen_data_from_complexes(
     strip_antibody_cdr: bool = True,
     cif_output_dir: Optional[Path] = None,
     one_row_per_complex: bool = False,
+    mfdesign_chain_subset: bool = False,
 ):
     """Generate training data per antibody-antigen complex from a JSON dict containing all structures to be processed.
 
@@ -527,6 +532,7 @@ def gen_data_from_complexes(
                     distillation,
                     strip_antibody_cdr,
                     cif_output_dir,
+                    mfdesign_chain_subset,
                 )
                 for (complex_id, pdb_id, mmcif, entry) in work
             ),
