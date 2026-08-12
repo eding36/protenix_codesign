@@ -73,6 +73,39 @@ def load_ca(path: str) -> "dict[tuple[str, int], np.ndarray]":
     }
 
 
+BACKBONE = {"N", "CA", "C", "O"}
+
+
+def load_sidechain(path: str) -> "dict[tuple[str, int], dict[str, np.ndarray]]":
+    """Map (chain, res_id) -> {atom_name: coord} for SIDE-CHAIN atoms beyond CB.
+
+    CB is excluded deliberately: preprocessing strips CDR side chains to
+    backbone+CB, so including CB would let stripped CDR residues contribute a
+    number that is really determined by the backbone. Beyond-CB atoms are exactly
+    the ones a rotamer places, so their absence is what "stripped" means.
+    """
+    import biotite.structure.io.pdb as biotite_pdb
+    import biotite.structure.io.pdbx as biotite_pdbx
+
+    if path.endswith(".pdb"):
+        arr = biotite_pdb.PDBFile.read(path).get_structure(model=1)
+    else:
+        arr = biotite_pdbx.get_structure(biotite_pdbx.CIFFile.read(path), model=1)
+    out: "dict[tuple[str, int], dict[str, np.ndarray]]" = {}
+    for i in range(len(arr)):
+        name = str(arr.atom_name[i])
+        if name in BACKBONE or name == "CB" or str(arr.element[i]) == "H":
+            continue
+        xyz = arr.coord[i]
+        # The parser writes unresolved atoms at exactly (0,0,0) -- including one in
+        # the RMSD puts a spurious ~30 A term in every affected residue. Dropping
+        # them here is the same guard the chi metric needs.
+        if not np.any(xyz) or np.isnan(xyz).any():
+            continue
+        out.setdefault((str(arr.chain_id[i]), int(arr.res_id[i])), {})[name] = xyz
+    return out
+
+
 def kabsch(mobile: np.ndarray, target: np.ndarray) -> "tuple[np.ndarray, np.ndarray]":
     """Rotation/translation superposing ``mobile`` onto ``target`` (both [N, 3])."""
     mc, tc = mobile.mean(0), target.mean(0)
@@ -134,6 +167,7 @@ def score_one(pred_cif, native_cif, meta, relax_dir=None) -> "dict[str, float]":
         path = relaxed
 
     pred, native = load_ca(path), load_ca(native_cif)
+    pred_sc, native_sc = load_sidechain(path), load_sidechain(native_cif)
     residues = [r for r in meta["residues"] if r["resolved"]]
 
     def coords(keep):
@@ -197,6 +231,42 @@ def score_one(pred_cif, native_cif, meta, relax_dir=None) -> "dict[str, float]":
             np.stack([xform[k] for k in loop]), np.stack([native[k] for k in loop])
         )
         out["n_H3_loop"] = len(loop)
+
+    # 4. SIDE-CHAIN RMSD per region, on the same framework superposition.
+    #
+    # Atoms beyond CB only -- those are the ones a rotamer places. CDR side chains
+    # are stripped to backbone+CB during preprocessing, so sc_n_cdr is expected to
+    # be 0: the metric reports that explicitly rather than silently omitting the
+    # region, because "we cannot measure designed side chains" is a result.
+    # Framework / antigen / epitope are measurable and are where torsion noising
+    # and the chi loss can actually act.
+    groups = {
+        "cdr": lambda r: r["chain_type"] in (1, 2) and r["region_type"] in (2, 4, 6),
+        "framework": lambda r: r["chain_type"] in (1, 2)
+        and r["region_type"] in FRAMEWORK_REGIONS,
+        "antigen": lambda r: r["chain_type"] == 3,
+        "epitope": lambda r: r["region_type"] == 9,
+    }
+    for gname, keep in groups.items():
+        pv, nv = [], []
+        nres = 0
+        for r in residues:
+            if not keep(r):
+                continue
+            k = (r["chain"], r["res_id"])
+            pa, na = pred_sc.get(k), native_sc.get(k)
+            if not pa or not na:
+                continue
+            shared = [a for a in pa if a in na]
+            if not shared:
+                continue
+            nres += 1
+            for a in shared:
+                pv.append(rot @ pa[a] + trans)   # same superposition as the Ca metrics
+                nv.append(na[a])
+        out[f"sc_rmsd_{gname}"] = rmsd(np.stack(pv), np.stack(nv)) if pv else float("nan")
+        out[f"sc_n_{gname}"] = len(pv)
+        out[f"sc_res_{gname}"] = nres
     return out
 
 
@@ -264,14 +334,24 @@ def main() -> None:
     print(f"{'metric':<16}{'RANK0':>9}{'mean':>9}{'best':>9}{'n_tgt':>7}")
     print("-" * 50)
     for k in keys:
-        if not k.startswith("rmsd"):
+        if not (k.startswith("rmsd") or k.startswith("sc_rmsd")):
+            continue
+        # CDR side chains are stripped to backbone+CB during preprocessing, so
+        # sc_rmsd_cdr can never be computed. The column stays in the CSV as an
+        # explicit record; there is nothing to summarise.
+        if k == "sc_rmsd_cdr":
             continue
         r0, mn, bs = [], [], []
         for _pid, samples in by_target.items():
-            vals = [s[k] for s in samples.values() if k in s]
+            # NaN = that region is absent from this target (e.g. no antigen chain).
+            # Averaging it in would poison the whole column.
+            vals = [
+                float(s[k]) for s in samples.values()
+                if k in s and not np.isnan(float(s[k]))
+            ]
             if not vals:
                 continue
-            if 0 in samples and k in samples[0]:
+            if 0 in samples and k in samples[0] and not np.isnan(float(samples[0][k])):
                 r0.append(float(samples[0][k]))
             mn.append(float(np.mean(vals)))
             bs.append(float(np.min(vals)))
