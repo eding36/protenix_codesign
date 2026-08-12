@@ -451,10 +451,12 @@ class Protenix(nn.Module):
                 "summary_confidence": _list_join(pred_dicts, "summary_confidence"),
                 "full_data": _list_join(pred_dicts, "full_data"),
                 "plddt": _cat(pred_dicts, "plddt"),
-                "pae": _cat(pred_dicts, "pae"),
-                "pde": _cat(pred_dicts, "pde"),
                 "resolved": _cat(pred_dicts, "resolved"),
             }
+            # pae/pde are absent when confidence_stream_size freed them per group.
+            for key in ("pae", "pde"):
+                if all(key in x for x in pred_dicts):
+                    all_pred_dict[key] = _cat(pred_dicts, key)
             if self.sequence_train:
                 all_pred_dict["sequence"] = _cat(pred_dicts, "sequence")
 
@@ -669,24 +671,127 @@ class Protenix(nn.Module):
             **sample_confidence.get_bin_params(self.configs.loss.distogram),
         )  # [N_token, N_token]
 
-        # Confidence logits
-        (
-            pred_dict["plddt"],
-            pred_dict["pae"],
-            pred_dict["pde"],
-            pred_dict["resolved"],
-        ) = self.run_confidence_head(
-            input_feature_dict=input_feature_dict,
-            s_inputs=s_inputs,
-            s_trunk=s,
-            z_trunk=z,
-            pair_mask=None,
-            x_pred_coords=pred_dict["coordinate"],
-            triangle_multiplicative=self.configs.triangle_multiplicative,
-            triangle_attention=self.configs.triangle_attention,
-            inplace_safe=inplace_safe,
-            chunk_size=chunk_size,
-        )
+        # Confidence + permutation + summary, streamed over samples. pae/pde are
+        # [N_sample, N_token, N_token, 64] and only the summary reads them, so a
+        # group is freed once consumed. stream=0 keeps the single-shot path.
+        if label_dict is None:
+            interested_atom_mask = None
+        else:
+            interested_atom_mask = label_dict.get("interested_ligand_mask", None)
+
+        n_sample_out = pred_dict["coordinate"].shape[-3]
+        stream = getattr(self.configs.infer_setting, "confidence_stream_size", None)
+        streaming = bool(stream) and 0 < int(stream) < n_sample_out
+        group = int(stream) if streaming else n_sample_out
+
+        coords_all = pred_dict["coordinate"]
+        seq_all = pred_dict.pop("sequence", None)
+        coord_parts, plddt_parts, resolved_parts = [], [], []
+        pae_keep = pde_keep = None
+        summary_all, full_all = [], []
+
+        for g0 in range(0, n_sample_out, group):
+            g1 = min(g0 + group, n_sample_out)
+            sub = {
+                k: v
+                for k, v in pred_dict.items()
+                if k
+                not in (
+                    "coordinate",
+                    "plddt",
+                    "pae",
+                    "pde",
+                    "resolved",
+                    "per_sample_contact_probs",
+                    "summary_confidence",
+                    "full_data",
+                )
+            }
+            sub["coordinate"] = coords_all[..., g0:g1, :, :]
+
+            (
+                sub["plddt"],
+                sub["pae"],
+                sub["pde"],
+                sub["resolved"],
+            ) = self.run_confidence_head(
+                input_feature_dict=input_feature_dict,
+                s_inputs=s_inputs,
+                s_trunk=s,
+                z_trunk=z,
+                pair_mask=None,
+                x_pred_coords=sub["coordinate"],
+                triangle_multiplicative=self.configs.triangle_multiplicative,
+                triangle_attention=self.configs.triangle_attention,
+                inplace_safe=inplace_safe,
+                chunk_size=chunk_size,
+            )
+
+            # Permute before the summary reads the group.
+            if label_dict is not None and symmetric_permutation is not None:
+                sub, log_dict = symmetric_permutation.permute_inference_pred_dict(
+                    input_feature_dict=input_feature_dict,
+                    pred_dict=sub,
+                    label_dict=label_dict,
+                    permute_by_pocket=("pocket_mask" in label_dict)
+                    and ("interested_ligand_mask" in label_dict),
+                )
+
+            summary_i, full_i = autocasting_disable_decorator(True)(
+                sample_confidence.compute_full_data_and_summary
+            )(
+                configs=self.configs,
+                pae_logits=sub["pae"],
+                plddt_logits=sub["plddt"],
+                pde_logits=sub["pde"],
+                contact_probs=sub.get(
+                    "per_sample_contact_probs", pred_dict["contact_probs"]
+                ),
+                token_asym_id=input_feature_dict["asym_id"],
+                token_has_frame=input_feature_dict["has_frame"],
+                atom_coordinate=sub["coordinate"],
+                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+                atom_is_polymer=1 - input_feature_dict["is_ligand"],
+                N_recycle=N_cycle,
+                interested_atom_mask=interested_atom_mask,
+                return_full_data=True,
+                mol_id=(input_feature_dict["mol_id"] if mode != "inference" else None),
+                elements_one_hot=(
+                    input_feature_dict["ref_element"] if mode != "inference" else None
+                ),
+            )
+            summary_all.extend(summary_i)
+            if streaming:
+                # token_pair_pae/pde are [N_token, N_token] per sample and are
+                # never written here (need_atom_confidence is False); only
+                # atom_plddt is used, for B-factors.
+                full_i = [
+                    {k: v for k, v in d.items() if k == "atom_plddt"} for d in full_i
+                ]
+            full_all.extend(full_i)
+            coord_parts.append(sub["coordinate"])
+            plddt_parts.append(sub["plddt"])
+            resolved_parts.append(sub["resolved"])
+            if not streaming:
+                # Keep logits for the confidence loss / multi-seed path.
+                pae_keep, pde_keep = sub["pae"], sub["pde"]
+            del sub
+
+        pred_dict["coordinate"] = torch.cat(coord_parts, dim=-3)
+        pred_dict["plddt"] = torch.cat(plddt_parts, dim=-3)
+        pred_dict["resolved"] = torch.cat(resolved_parts, dim=-3)
+        if pae_keep is not None:
+            pred_dict["pae"], pred_dict["pde"] = pae_keep, pde_keep
+        if seq_all is not None:
+            pred_dict["sequence"] = seq_all
+        del coord_parts, plddt_parts, resolved_parts, coords_all
+
+        step_confidence = time.time()
+        time_tracker.update({"confidence": step_confidence - step_diffusion})
+        time_tracker.update({"model_forward": time.time() - step_st})
+        # Permutation is folded into the streamed loop above.
+        if label_dict is not None and symmetric_permutation is not None:
+            time_tracker.update({"permutation": 0.0})
 
         # ---- rank the designs by model confidence (MFDesign parity) -----------
         # MFDesign's writer.py sorts the N diffusion samples by confidence_score
@@ -694,92 +799,46 @@ class Protenix(nn.Module):
         # IS rank 0 for every downstream consumer -- the loss, the dumper and the
         # written structures all agree on the ranking.
         #
-        # Confidence = expected pLDDT over the DESIGNED atoms (the CDR), which is
-        # what the ranking is meant to discriminate; falls back to all atoms when
-        # no design mask is available. Protenix has no single confidence_score
-        # scalar the way Boltz does, so this is the closest analogue.
+        # MFDesign's formula: (4 * complex_plddt + (iptm or ptm)) / 5.
+        # Protenix stores plddt on 0-100, ptm/iptm on 0-1; rescale to match.
         if self.sequence_train and pred_dict.get("sequence") is not None:
-            plddt_logits = pred_dict.get("plddt")
             seq_out = pred_dict["sequence"]
             n_design = seq_out.shape[0] if seq_out.dim() >= 2 else 1
-            if plddt_logits is not None and n_design > 1:
+            if n_design > 1 and len(summary_all) == n_design:
                 with torch.no_grad():
-                    nb = plddt_logits.shape[-1]
-                    centers = torch.linspace(
-                        0.0, 1.0, nb, device=plddt_logits.device,
-                        dtype=torch.float32,
-                    )
-                    exp_plddt = (
-                        plddt_logits.float().softmax(dim=-1) * centers
-                    ).sum(dim=-1)                      # [..., N_sample, N_atom]
-                    while exp_plddt.dim() > 2:         # drop leading batch dims
-                        exp_plddt = exp_plddt[0]
-                    w = None
-                    cdr_tok = input_feature_dict.get("cdr_mask")
-                    if cdr_tok is not None and "atom_to_token_idx" in input_feature_dict:
-                        a2t = input_feature_dict["atom_to_token_idx"].reshape(-1).long()
-                        w = cdr_tok.reshape(-1).bool()[a2t]
-                        if not bool(w.any()):
-                            w = None
-                    score = (
-                        exp_plddt[..., w].mean(dim=-1)
-                        if w is not None
-                        else exp_plddt.mean(dim=-1)
+                    vals = []
+                    for d in summary_all:
+                        plddt = float(d["plddt"]) / 100.0
+                        iptm = float(d.get("iptm", 0.0))
+                        ptm = float(d.get("ptm", 0.0))
+                        vals.append((4.0 * plddt + (iptm if iptm != 0.0 else ptm)) / 5.0)
+                    score = torch.tensor(
+                        vals, dtype=torch.float32, device=seq_out.device
                     )                                   # [N_sample]
                     order = torch.argsort(score, descending=True)
+                # Every per-sample output must follow the ranking, including
+                # the summary_confidence / full_data lists.
+                idx = order.tolist()
                 pred_dict["confidence_score"] = score[order]
                 pred_dict["sequence"] = seq_out[order]
                 if pred_dict["coordinate"].shape[-3] == n_design:
                     pred_dict["coordinate"] = pred_dict["coordinate"][..., order, :, :]
+                for key in ("plddt", "resolved"):
+                    if pred_dict.get(key) is not None and (
+                        pred_dict[key].shape[-3] == n_design
+                    ):
+                        pred_dict[key] = pred_dict[key][..., order, :, :]
+                for key in ("pae", "pde"):
+                    if pred_dict.get(key) is not None and (
+                        pred_dict[key].shape[-4] == n_design
+                    ):
+                        pred_dict[key] = pred_dict[key][..., order, :, :, :]
+                if len(summary_all) == n_design:
+                    summary_all = [summary_all[i] for i in idx]
+                    full_all = [full_all[i] for i in idx]
 
-        step_confidence = time.time()
-        time_tracker.update({"confidence": step_confidence - step_diffusion})
-        time_tracker.update({"model_forward": time.time() - step_st})
-
-        # Permutation: when label is given, permute coordinates and other heads
-        if label_dict is not None and symmetric_permutation is not None:
-            pred_dict, log_dict = symmetric_permutation.permute_inference_pred_dict(
-                input_feature_dict=input_feature_dict,
-                pred_dict=pred_dict,
-                label_dict=label_dict,
-                permute_by_pocket=("pocket_mask" in label_dict)
-                and ("interested_ligand_mask" in label_dict),
-            )
-            last_step_seconds = step_confidence
-            time_tracker.update({"permutation": time.time() - last_step_seconds})
-
-        # Summary Confidence & Full Data
-        # Computed after coordinates and logits are permuted
-        if label_dict is None:
-            interested_atom_mask = None
-        else:
-            interested_atom_mask = label_dict.get("interested_ligand_mask", None)
-        (
-            pred_dict["summary_confidence"],
-            pred_dict["full_data"],
-        ) = autocasting_disable_decorator(True)(
-            sample_confidence.compute_full_data_and_summary
-        )(
-            configs=self.configs,
-            pae_logits=pred_dict["pae"],
-            plddt_logits=pred_dict["plddt"],
-            pde_logits=pred_dict["pde"],
-            contact_probs=pred_dict.get(
-                "per_sample_contact_probs", pred_dict["contact_probs"]
-            ),
-            token_asym_id=input_feature_dict["asym_id"],
-            token_has_frame=input_feature_dict["has_frame"],
-            atom_coordinate=pred_dict["coordinate"],
-            atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
-            atom_is_polymer=1 - input_feature_dict["is_ligand"],
-            N_recycle=N_cycle,
-            interested_atom_mask=interested_atom_mask,
-            return_full_data=True,
-            mol_id=(input_feature_dict["mol_id"] if mode != "inference" else None),
-            elements_one_hot=(
-                input_feature_dict["ref_element"] if mode != "inference" else None
-            ),
-        )
+        pred_dict["summary_confidence"] = summary_all
+        pred_dict["full_data"] = full_all
 
         return pred_dict, log_dict, time_tracker
 
