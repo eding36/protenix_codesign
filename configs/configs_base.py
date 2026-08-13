@@ -347,6 +347,8 @@ model_configs = {
             # Declared here so it registers as a CLI flag: train.py parses argv
             # against the base configs before merging the model-type preset.
             "sequence_noise_type": "discrete_uniform",
+            # False for the plain structure model; the codesign preset sets True.
+            "sequence_train": False,
             "sigma_data": GlobalConfigValue("sigma_data"),
             "c_token": 768,
             "c_atom": GlobalConfigValue("c_atom"),
