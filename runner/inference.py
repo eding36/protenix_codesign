@@ -148,7 +148,9 @@ class InferenceRunner(object):
         Raises:
             FileNotFoundError: If the checkpoint path does not exist.
         """
-        checkpoint_path = opjoin(
+        # An explicit path wins, so locally trained checkpoints (codesign) can be
+        # used without being named after the model preset.
+        checkpoint_path = getattr(self.configs, "load_checkpoint_path", "") or opjoin(
             self.configs.load_checkpoint_dir, f"{self.configs.model_name}.pt"
         )
         if not opexists(checkpoint_path):
@@ -337,6 +339,10 @@ def download_inference_cache(configs: Any) -> None:
 
     checkpoint_path = f"{configs.load_checkpoint_dir}/{configs.model_name}.pt"
     checkpoint_dir = configs.load_checkpoint_dir
+
+    # A locally trained checkpoint (e.g. codesign) has no download URL; skip.
+    if getattr(configs, "load_checkpoint_path", "") or configs.model_name not in URL:
+        return
 
     if not opexists(checkpoint_path):
         os.makedirs(checkpoint_dir, exist_ok=True)
