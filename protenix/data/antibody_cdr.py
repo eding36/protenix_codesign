@@ -529,6 +529,61 @@ def load_sabdab_chain_roles(csv_path) -> "dict[str, list[dict]]":
     return roles
 
 
+def split_scfv_chains(atom_array, entries: "list[dict]"):
+    """Give an scFv's VL domain its own chain.
+
+    SAbDab writes single-chain Fvs as H='A', L='a': both variable domains sit in
+    one author chain, distinguished only by case. mmCIF has no lowercase chain,
+    so the light half resolves to nothing and gets labelled CHAIN_TYPE_HEAVY.
+    Locate the VL by its curated L_seq and split it off, so role resolution and
+    chain_type see two chains. No-op when the light chain already exists.
+    """
+    import difflib
+
+    cats = atom_array.get_annotation_categories()
+    if "auth_asym_id" not in cats or "asym_id_int" not in cats or not entries:
+        return atom_array, 0
+
+    auth = atom_array.auth_asym_id
+    n_split = 0
+    for e in entries:
+        H, L, lseq = e.get("H"), e.get("L"), e.get("L_seq")
+        if not (H and L and lseq):
+            continue
+        H, L = str(H), str(L)
+        if H.lower() != L.lower() or H == L or (auth == L).any():
+            continue
+        sel = np.where(auth == H)[0]
+        if len(sel) == 0:
+            continue
+        res_ids = atom_array.res_id[sel]
+        _, first = np.unique(res_ids, return_index=True)
+        order = res_ids[np.sort(first)]
+        seq = "".join(
+            mmcif_restype_3to1.get(str(n), "X")
+            for n in atom_array.res_name[sel][np.sort(first)]
+        )
+        off = seq.find(lseq)
+        if off >= 0:
+            span = order[off : off + len(lseq)]
+        else:
+            blocks = difflib.SequenceMatcher(None, lseq, seq, autojunk=False)
+            m = blocks.find_longest_match(0, len(lseq), 0, len(seq))
+            if m.size < 0.6 * len(lseq):
+                continue
+            span = order[m.b : m.b + m.size]
+        mask = np.zeros(len(atom_array), dtype=bool)
+        mask[sel] = np.isin(res_ids, span)
+        if not mask.any():
+            continue
+        new_asym = int(atom_array.asym_id_int.max()) + 1
+        atom_array.asym_id_int[mask] = new_asym
+        atom_array.auth_asym_id[mask] = L
+        auth = atom_array.auth_asym_id
+        n_split += 1
+    return atom_array, n_split
+
+
 def resolve_sabdab_roles(
     atom_array, entries: "list[dict]"
 ) -> "tuple[list[int], list[int], list[int]]":
@@ -583,3 +638,62 @@ def resolve_sabdab_roles(
     light = _map([chosen["L"]] if chosen.get("L") else [])
     antigen = _map(chosen.get("antigen", []))
     return heavy, light, antigen
+
+
+def add_codesign_annots_for_inference(token_array, atom_array):
+    """Label chain_type / region_type / is_cdr_residue from sequence alone.
+
+    The inference path builds structures from a JSON of sequences, so there are no
+    SAbDab role annotations. Number every protein chain with abnumber: chains that
+    number as an antibody variable domain become heavy (1) or light (2) with their
+    Chothia region labels; everything else is antigen (3).
+
+    Only positions the caller masked with ``X`` (parsed as UNK) are designable, so
+    a fully specified sequence yields pure structure prediction. This matches
+    MFDesign's yaml convention, where the CDRs to design are already X-ed out.
+    Returns the number of designable tokens.
+    """
+    centre = token_array.get_annotation("centre_atom_index")
+    asym = atom_array.asym_id_int
+    seq_cache: dict = {}
+    chain_type = np.zeros(len(centre), dtype=int)
+    region_type = np.zeros(len(centre), dtype=int)
+    is_cdr = np.zeros(len(centre), dtype=bool)
+
+    for c in np.unique(asym):
+        tok = np.where(asym[centre] == c)[0]
+        if len(tok) < 50:
+            chain_type[tok] = CHAIN_TYPE_ANTIGEN
+            region_type[tok] = REGION_TYPE_ANTIGEN
+            continue
+        struct_seq = "".join(
+            mmcif_restype_3to1.get(str(n), "X") for n in atom_array.res_name[centre][tok]
+        )
+        labels = _chain_residue_region_labels(struct_seq, seq_cache)
+        if labels is None:
+            chain_type[tok] = CHAIN_TYPE_ANTIGEN
+            # Epitope (9) needs coordinates, which inference does not have yet;
+            # label every antigen token non-epitope.
+            region_type[tok] = REGION_TYPE_ANTIGEN
+            continue
+        try:
+            import abnumber
+
+            ch = abnumber.Chain(
+                struct_seq.replace("X", ""), scheme="chothia", use_anarcii=True,
+                anarcii_args={"cpu": True, "ncpu": 1},
+            )
+            is_heavy = ch.chain_type == "H"
+        except Exception:
+            is_heavy = True
+        chain_type[tok] = CHAIN_TYPE_HEAVY if is_heavy else CHAIN_TYPE_LIGHT
+        for i, lab in zip(tok, labels):
+            region_type[i] = int(lab)
+    # Designable == explicitly masked, on an antibody chain.
+    unk = atom_array.res_name[centre] == "UNK"
+    is_cdr = unk & np.isin(chain_type, (CHAIN_TYPE_HEAVY, CHAIN_TYPE_LIGHT))
+
+    token_array.set_annotation("chain_type", chain_type.tolist())
+    token_array.set_annotation("region_type", region_type.tolist())
+    token_array.set_annotation("is_cdr_residue", is_cdr.tolist())
+    return token_array, int(is_cdr.sum())

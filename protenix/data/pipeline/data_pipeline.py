@@ -29,6 +29,7 @@ from protenix.data.antibody_cdr import (
     add_chain_and_region_types_to_token_array,
     add_is_cdr_residue_to_token_array,
     resolve_sabdab_roles,
+    split_scfv_chains,
     strip_cdr_side_chains,
 )
 from protenix.data.constants import PRO_STD_RESIDUES, mmcif_restype_3to1
@@ -264,6 +265,15 @@ class DataPipeline(object):
                 bioassembly_dict["atom_array"] = DataPipeline.keep_one_assembly_copy(
                     bioassembly_dict["atom_array"]
                 )
+
+            # scFvs put VH and VL in one author chain (H='A', L='a'); split the
+            # light half off before anything resolves roles.
+            if sabdab_roles:
+                _e = sabdab_roles.get(str(bioassembly_dict["pdb_id"]).lower())
+                if _e:
+                    bioassembly_dict["atom_array"], _n = split_scfv_chains(
+                        bioassembly_dict["atom_array"], _e
+                    )
 
             # Match MFDesign's yaml: one chain per role, antibody chains cut to the Fv.
             # Applied before tokenization so all downstream annotations follow.
