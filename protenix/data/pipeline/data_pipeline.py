@@ -404,6 +404,22 @@ class DataPipeline(object):
                         )
                     )
                     bioassembly_dict["token_array"] = token_array
+                    # A complex whose H/L chains carry no CDR label trains as a
+                    # framework-only example: nothing is noised and nothing is
+                    # scored. Log it rather than let it pass silently.
+                    try:
+                        _cdr = np.asarray(
+                            token_array.get_annotation("is_cdr_residue")
+                        ).astype(bool)
+                        if (heavy_ids or light_ids) and not _cdr.any():
+                            logger.warning(
+                                "No CDR tokens labelled for %s (H=%s L=%s): chain "
+                                "could not be aligned to the summary or numbered by "
+                                "abnumber; it will train as framework-only.",
+                                bioassembly_dict["pdb_id"], heavy_ids, light_ids,
+                            )
+                    except Exception:
+                        pass
                     # MFDesign-style epitope gate: an antibody-antigen complex with
                     # no antigen residue within the epitope cutoff carries no usable
                     # epitope signal for codesign -- drop it (no samples emitted).

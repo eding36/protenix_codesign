@@ -76,6 +76,32 @@ def load_ca(path: str) -> "dict[tuple[str, int], np.ndarray]":
 BACKBONE = {"N", "CA", "C", "O"}
 
 
+def load_allatom(path: str) -> "dict[tuple[str, int], dict[str, np.ndarray]]":
+    """Map (chain, res_id) -> {atom_name: coord} for ALL heavy atoms.
+
+    Dihedrals need the backbone anchors too (chi1 is N-CA-CB-CG), so this cannot
+    reuse load_sidechain, which deliberately drops backbone and CB.
+    """
+    import biotite.structure.io.pdb as biotite_pdb
+    import biotite.structure.io.pdbx as biotite_pdbx
+
+    if path.endswith(".pdb"):
+        arr = biotite_pdb.PDBFile.read(path).get_structure(model=1)
+    else:
+        arr = biotite_pdbx.get_structure(biotite_pdbx.CIFFile.read(path), model=1)
+    out: "dict[tuple[str, int], dict[str, np.ndarray]]" = {}
+    for i in range(len(arr)):
+        if str(arr.element[i]) == "H":
+            continue
+        c = arr.coord[i]
+        if not np.isfinite(c).all() or float(np.linalg.norm(c)) < 1e-3:
+            continue  # unresolved atoms are parked at the origin
+        out.setdefault((str(arr.chain_id[i]), int(arr.res_id[i])), {})[
+            str(arr.atom_name[i])
+        ] = c
+    return out
+
+
 def load_sidechain(path: str) -> "dict[tuple[str, int], dict[str, np.ndarray]]":
     """Map (chain, res_id) -> {atom_name: coord} for SIDE-CHAIN atoms beyond CB.
 
@@ -168,6 +194,7 @@ def score_one(pred_cif, native_cif, meta, relax_dir=None) -> "dict[str, float]":
 
     pred, native = load_ca(path), load_ca(native_cif)
     pred_sc, native_sc = load_sidechain(path), load_sidechain(native_cif)
+    pred_all, native_all = load_allatom(path), load_allatom(native_cif)
     residues = [r for r in meta["residues"] if r["resolved"]]
 
     def coords(keep):
@@ -267,6 +294,49 @@ def score_one(pred_cif, native_cif, meta, relax_dir=None) -> "dict[str, float]":
         out[f"sc_rmsd_{gname}"] = rmsd(np.stack(pv), np.stack(nv)) if pv else float("nan")
         out[f"sc_n_{gname}"] = len(pv)
         out[f"sc_res_{gname}"] = nres
+
+    # 5. CHI MAE per region, degrees. Torsion noising and the chi loss act on side
+    #    chain dihedrals, so this is the metric that shows whether they survived.
+    #    Rotation-invariant: dihedrals need no superposition. Periodic chis (Asp1,
+    #    Glu2, Phe1, Tyr1) are scored modulo 180 -- a flip is the same molecule.
+    from protenix.data.constants import _CHI_ANGLES_ATOMS
+    PI_PERIODIC = {("ASP", 1), ("GLU", 2), ("PHE", 1), ("TYR", 1)}
+
+    def _dihedral(p0, p1, p2, p3):
+        b0, b1, b2 = p0 - p1, p2 - p1, p3 - p2
+        n1 = np.cross(b0, b1); n2 = np.cross(-b1, b2)
+        n = np.linalg.norm(b1)
+        if n < 1e-8:
+            return None
+        m = np.cross(n1, b1 / n)
+        x = float(np.dot(n1, n2)); y = float(np.dot(m, n2))
+        return np.degrees(np.arctan2(y, x))
+
+    for gname, keep in groups.items():
+        errs = []
+        for r in residues:
+            if not keep(r):
+                continue
+            rn = r.get("res_name")
+            chis = _CHI_ANGLES_ATOMS.get(str(rn))
+            if not chis:
+                continue
+            k = (r["chain"], r["res_id"])
+            pa, na = pred_all.get(k), native_all.get(k)
+            if not pa or not na:
+                continue
+            for ci, quad in enumerate(chis):
+                if any(a not in pa or a not in na for a in quad):
+                    continue
+                dp = _dihedral(*[pa[a] for a in quad])
+                dn = _dihedral(*[na[a] for a in quad])
+                if dp is None or dn is None:
+                    continue
+                period = 180.0 if (str(rn), ci) in PI_PERIODIC else 360.0
+                d = abs(dp - dn) % period
+                errs.append(min(d, period - d))
+        out[f"chi_mae_{gname}"] = float(np.mean(errs)) if errs else float("nan")
+        out[f"chi_n_{gname}"] = len(errs)
     return out
 
 
