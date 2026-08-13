@@ -40,6 +40,11 @@ GPU="${GPU:-0,1}"
 NPROC="$(awk -F, '{print NF}' <<< "${GPU}")"
 N_SAMPLE="${N_SAMPLE:-20}"   # 20 designs per target, matching MFDesign predict.py
 INPAINT="${INPAINT:-true}"   # replacement sampling (MFDesign --structure_inpainting)
+# MUST match what the checkpoint was TRAINED with -- the sampler branches on this.
+# Omitting the flag silently falls back to the config default (discrete_uniform),
+# which rolls the sequence out with a different reverse process than training used
+# and voids every metric. Stages 3 and 4 both train with discrete_absorb.
+SEQ_NOISE="${SEQ_NOISE:-discrete_absorb}"
 # MAX_TOKEN="${MAX_TOKEN:-3840}"
 MAX_TOKEN="3840"
 RUN_DIR="${RUN_DIR:-./output/protenix_antibody_codesign_stage_4_angular_diffusion_20260811_101834/}"
@@ -81,6 +86,20 @@ if [[ ! -x "${TORCHRUN}" ]]; then
   fi
 fi
 
+# Cross-check the sampler against what the checkpoint was trained with. A
+# mismatch here is silent at runtime and voids every metric, so refuse to start.
+TRAIN_SH="$(ls antibody_codesign*stage_4*.sh 2>/dev/null | head -1)"
+if [[ -n "${TRAIN_SH}" ]]; then
+  TRAINED_NOISE="$(grep -oE 'sequence_noise_type[= ][^ \\]*' "${TRAIN_SH}" \
+    | head -1 | awk '{print $NF}' | tr -d '"')"
+  if [[ -n "${TRAINED_NOISE}" && "${TRAINED_NOISE}" != "${SEQ_NOISE}" ]]; then
+    echo "[error] SEQ_NOISE='${SEQ_NOISE}' but ${TRAIN_SH} trained with" >&2
+    echo "        '${TRAINED_NOISE}'. Evaluating with a different reverse" >&2
+    echo "        process than training voids the metrics. Set SEQ_NOISE=${TRAINED_NOISE}." >&2
+    exit 1
+  fi
+fi
+
 for g in ${GPU//,/ }; do
   USED_MIB="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "${g}" 2>/dev/null || echo 0)"
   if (( USED_MIB > 2000 )); then
@@ -108,6 +127,7 @@ echo "branch     : ${BRANCH}"
 echo "checkpoint : ${CKPT}"
 echo "GPU        : ${GPU}  (${NPROC} rank(s))"
 echo "N_sample   : ${N_SAMPLE}    inpainting: ${INPAINT}    max tokens: ${MAX_TOKEN}"
+echo "seq noise  : ${SEQ_NOISE}  (must match training)"
 echo "log        : ${LOG}"
 echo
 
@@ -130,6 +150,7 @@ CUDA_VISIBLE_DEVICES="${GPU}" "${TORCHRUN}" --standalone --nproc_per_node="${NPR
   --model.N_cycle 4 \
   --sample_diffusion.N_step 200 \
   --sample_diffusion.N_sample "${N_SAMPLE}" \
+  --model.diffusion_module.sequence_noise_type "${SEQ_NOISE}" \
   --infer_setting.sample_diffusion_chunk_size 2 \
   --skip_amp.sample_diffusion false \
   --triangle_attention "cuequivariance" \
