@@ -43,6 +43,11 @@ N_SAMPLE="${N_SAMPLE:-20}"   # 20 designs per target, matching MFDesign predict.
 # so training absorbing and sampling uniform silently produces garbage.
 SEQ_NOISE="${SEQ_NOISE:-discrete_absorb}"
 INPAINT="${INPAINT:-true}"   # replacement sampling (MFDesign --structure_inpainting)
+# MUST match what the checkpoint was TRAINED with -- the sampler branches on this.
+# Omitting the flag silently falls back to the config default (discrete_uniform),
+# which rolls the sequence out with a different reverse process than training used
+# and voids every metric. Stages 3 and 4 both train with discrete_absorb.
+SEQ_NOISE="${SEQ_NOISE:-discrete_absorb}"
 # MAX_TOKEN="${MAX_TOKEN:-3840}"
 MAX_TOKEN="3840"
 RUN_DIR="${RUN_DIR:-./output/protenix_antibody_codesign_stage_4_20260802_140148}"
@@ -80,6 +85,20 @@ if [[ ! -x "${TORCHRUN}" ]]; then
   else
     echo "[error] torchrun not found at ${TORCHRUN} and not on PATH." >&2
     echo "        activate the protenix env or set TORCHRUN=<path>." >&2
+    exit 1
+  fi
+fi
+
+# Cross-check the sampler against what the checkpoint was trained with. A
+# mismatch here is silent at runtime and voids every metric, so refuse to start.
+TRAIN_SH="$(ls antibody_codesign*stage_4*.sh 2>/dev/null | head -1)"
+if [[ -n "${TRAIN_SH}" ]]; then
+  TRAINED_NOISE="$(grep -oE 'sequence_noise_type[= ][^ \\]*' "${TRAIN_SH}" \
+    | head -1 | awk '{print $NF}' | tr -d '"')"
+  if [[ -n "${TRAINED_NOISE}" && "${TRAINED_NOISE}" != "${SEQ_NOISE}" ]]; then
+    echo "[error] SEQ_NOISE='${SEQ_NOISE}' but ${TRAIN_SH} trained with" >&2
+    echo "        '${TRAINED_NOISE}'. Evaluating with a different reverse" >&2
+    echo "        process than training voids the metrics. Set SEQ_NOISE=${TRAINED_NOISE}." >&2
     exit 1
   fi
 fi
