@@ -160,6 +160,21 @@ class InferenceDataset(Dataset):
             extract_features_for_tfg=self.configs.sample_diffusion.guidance.enable,
         )
         features_dict, atom_array, token_array = sample2feat.get_feature_dict()
+        # Codesign: the JSON path carries no SAbDab roles, so number the chains
+        # here to get chain_type / region_type / is_cdr_residue. Re-featurize so
+        # the CDR masking in Featurizer sees them.
+        if getattr(self.configs.model.diffusion_module, "sequence_train", False):
+            from protenix.data.antibody_cdr import add_codesign_annots_for_inference
+            from protenix.data.core.featurizer import Featurizer
+
+            token_array, n_cdr = add_codesign_annots_for_inference(
+                token_array, atom_array
+            )
+            if n_cdr == 0:
+                logger.warning("No CDR tokens found; nothing will be designed.")
+            features_dict = Featurizer(
+                token_array, atom_array, include_discont_poly_poly_bonds=True
+            ).get_all_input_features()
         features_dict["distogram_rep_atom_mask"] = torch.Tensor(
             atom_array.distogram_rep_atom_mask
         ).long()
