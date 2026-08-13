@@ -15,6 +15,8 @@
 from collections import defaultdict
 from typing import Optional, Union
 
+import os
+
 import numpy as np
 import torch
 from biotite.structure import Atom, AtomArray, get_residue_starts
@@ -365,9 +367,12 @@ class Featurizer(object):
         _chain_type = token_features["chain_type"]
         cdr_mask = cdr_mask & ((_chain_type == 1) | (_chain_type == 2))
         token_features["cdr_mask"] = cdr_mask
-        unk_index = STD_RESIDUES_WITH_GAP["UNK"]
-        restype_onehot[cdr_mask] = 0.0 #set CDR residues to 0 ("masking")
-        restype_onehot[cdr_mask, unk_index] = 1.0 #set these residues to "UNK" one hot encoding
+        # PROTENIX_GT_CDR_SEQUENCE=1 leaves CDR restypes intact, for structure-only
+        # baselines that fold the native sequence instead of designing it.
+        if os.environ.get("PROTENIX_GT_CDR_SEQUENCE", "") != "1":
+            unk_index = STD_RESIDUES_WITH_GAP["UNK"]
+            restype_onehot[cdr_mask] = 0.0 #set CDR residues to 0 ("masking")
+            restype_onehot[cdr_mask, unk_index] = 1.0 #set these residues to "UNK" one hot encoding
 
         token_features["token_index"] = torch.arange(0, len(self.cropped_token_array))
         token_features["residue_index"] = torch.from_numpy(
